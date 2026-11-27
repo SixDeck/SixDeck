@@ -1,0 +1,481 @@
+# Configuration du GTA 6 PC Port & Recompilation Tracker (v3 — Recherche globale)
+
+general:
+  min_relevance_score: 40
+  strict_gta6_mode: true
+  db_path: "data/tracker.db"
+  reports_dir: "reports"
+  request_timeout: 20.0
+  head_timeout: 6.0
+  max_concurrency: 6
+  lookback_days: 90
+  cycle_delay_seconds: 60
+  jitter_min_seconds: 1.0
+  jitter_max_seconds: 3.5
+  top_display_limit: 20
+
+# Identifiants obligatoires du jeu (ciblage strict GTA 6 / Recompilation)
+gta6_identifiers:
+  - "GTA 6"
+  - "GTA6"
+  - "GTA VI"
+  - "Grand Theft Auto VI"
+  - "Grand Theft Auto 6"
+  - "GTAVI"
+  - "GTA6Recomp"
+  - "GTAVIRecomp"
+  - "RAGE9"
+  - "RAGE 9"
+  - "Leonida"
+  - "game_scarlett_master.exe"
+  - "game_scarlett_master"
+  - "game_prospero"
+
+# Termes de recompilation haute valeur (bonus massif)
+gta6_high_value_terms:
+  - "game_scarlett_master.exe"
+  - "game_scarlett_master"
+  - "game_prospero"
+  - "GTA6Recomp"
+  - "GTAVIRecomp"
+  - "static recompilation"
+  - "recompiler"
+  - "llvm recomp"
+  - "ps5 recomp"
+  - "orbis recomp"
+  - "elf2cpp"
+  - "symbols.toml"
+  - "recomp_config"
+  - "UnleashedRecomp"
+  - "XenonRecomp"
+  - "N64Recomp"
+  - "pc port"
+  - "playable build"
+  - "full game"
+  - "eboot.bin"
+  - "rpf9"
+  - "rpf8"
+  - "rage9"
+  - "rage 9"
+  - "binary translation"
+  - "ai decompile"
+  - "sprx"
+  - "d3d12_xs"
+  - "d3d12_xs.dll"
+  - "xgameruntime"
+  - "neonbridge"
+  - "scarlettport"
+  - "xbox series"
+  - "xcrdapi"
+
+# Extensions de fichiers cibles à extraire & vérifier par HTTP HEAD
+target_extensions:
+  - ".tar.gz"
+  - ".toml"
+  - ".cpp"
+  - ".h"
+  - ".cmake"
+  - ".elf"
+  - ".sprx"
+  - ".rpf"
+  - ".zip"
+  - ".7z"
+  - ".bin"
+
+# Mots-clés techniques pondérés par pilier technologique
+keywords:
+  emulation:
+    weight: 22
+    terms:
+      - "pc port"
+      - "emulator"
+      - "shadPS4"
+      - "Kyty"
+      - "fpPS4"
+      - "PS5"
+      - "PS5 emulator"
+      - "ps5 recomp"
+      - "orbis recomp"
+      - "Xbox Series"
+      - "scarlett"
+      - "d3d12_xs"
+      - "xgameruntime"
+      - "Neonbridge"
+      - "Flamingo"
+      - "VItoriaBr"
+      - "VIctory"
+      - "ScarlettPort"
+      - "xcl"
+      - "tuxbox"
+      - "XCRDAPI"
+      - "DirectX 12"
+      - "orbis"
+      - "prospero"
+      - "GNM"
+      - "GNMX"
+      - "libSce"
+      - "translation layer"
+      - "HLE"
+      - "shaders"
+      - "dx12"
+  decomp:
+    weight: 25
+    terms:
+      - "recomp"
+      - "static recompilation"
+      - "recompiler"
+      - "decomp"
+      - "decompilation"
+      - "llvm recomp"
+      - "ps5 recomp"
+      - "orbis recomp"
+      - "elf2cpp"
+      - "symbols.toml"
+      - "recomp_config"
+      - "UnleashedRecomp"
+      - "XenonRecomp"
+      - "N64Recomp"
+      - "RAGE9"
+      - "RAGE 9"
+      - "RAGE engine"
+      - "rpf"
+      - "rpf8"
+      - "rpf9"
+      - "CodeWalker"
+      - "OpenIV"
+      - "eboot.bin"
+      - "sprx"
+      - "binary lifting"
+      - "LLVM lifting"
+  ai_re:
+    weight: 22
+    terms:
+      - "ai decompile"
+      - "AI decompiler"
+      - "LLM4Decompile"
+      - "LLM decompilation"
+      - "neural decompilation"
+      - "binary translation"
+      - "reverse engineering LLM"
+      - "Ghidra AI"
+      - "IDA Pro AI"
+      - "shaders"
+      - "shader generation"
+      - "neural rendering"
+  dumps:
+    weight: 24
+    terms:
+      - "dumper"
+      - "dump"
+      - "ps5 dumper"
+      - "orbis dumper"
+      - "prospero dumper"
+      - "itemzflow"
+      - "elf dump"
+      - "sprx dump"
+      - "memory dump"
+      - "symbol dump"
+      - "shader dump"
+      - "rpf dump"
+      - "decrypted elf"
+      - "fself"
+      - "self decrypt"
+      - "pkg unpacker"
+      - "pkg extractor"
+      - "pfs decrypt"
+      - "xvd"
+      - "xvds"
+      - "scarlett dump"
+      - "xbox dump"
+
+# Mots-clés secondaires (bonus de contexte technique)
+technical_bonus_terms:
+  - "ghidra"
+  - "ida pro"
+  - "radare2"
+  - "binary ninja"
+  - "llvm"
+  - "vulkan"
+  - "dx12"
+  - "spir-v"
+  - "dxil"
+  - "x86-64"
+  - "amd64"
+  - "elf"
+  - "sprx"
+  - "symbols"
+  - "syscall"
+  - "jit"
+  - "aot"
+  - "disassembler"
+  - "cmake"
+
+# Filtrage anti-malware/fake strict (les vraies archives de releases/forums techniques sont préservées)
+blacklist:
+  terms:
+    - "free download"
+    - "free crack"
+    - "crack"
+    - "cracked"
+    - "keygen"
+    - "survey"
+    - "no survey"
+    - "password in description"
+    - "installer.exe"
+    - "setup.exe"
+    - "apk"
+    - "mod menu"
+    - "mediafire"
+    - "mega.nz"
+    - "bit.ly"
+    - "tinyurl"
+    - "full game pc download"
+    - "pc download"
+    - "torrent"
+    - "repack"
+    - "fitgirl"
+    - "cheat engine"
+    - "aimbot"
+    - "hack tool"
+    - "activation key"
+    - "serial key"
+    - "leaked build download"
+    - "free steam key"
+  # Extensions bloquées si elles sont SEULES dans un dépôt non-release sans code source
+  suspicious_extensions:
+    - ".exe"
+    - ".msi"
+    - ".bat"
+    - ".cmd"
+    - ".scr"
+    - ".vbs"
+    - ".ps1"
+    - ".iso"
+    - ".apk"
+  # Domaines de confiance où les archives .zip / .7z / .tar.gz sont légitimes
+  trusted_archive_domains:
+    - "github.com"
+    - "gitlab.com"
+    - "codeberg.org"
+    - "archive.org"
+    - "huggingface.co"
+    - "gtaforums.com"
+    - "gbatemp.net"
+    - "reshax.com"
+    - "zenhax.com"
+
+# Critères de légitimité GitHub
+github_legitimacy:
+  min_account_age_days: 30
+  min_account_repos_if_new: 2
+  require_valid_code: true
+  reject_unchanged_forks: true
+  max_readme_to_code_ratio: 3.0
+  valid_languages:
+    - "C"
+    - "C++"
+    - "Rust"
+    - "Python"
+    - "Assembly"
+    - "C#"
+    - "GLSL"
+    - "HLSL"
+    - "Zig"
+    - "Go"
+    - "CMake"
+    - "LLVM"
+  min_code_bytes: 500
+  inspect_top_n_repos: 40
+
+# Configuration des sources
+sources:
+  github:
+    enabled: true
+    per_query_limit: 30
+    max_pages_per_query: 3
+    queries:
+      # Pilier 1 : Runtime / Émulateur PS5 ou Xbox Series mature
+      - '"shadPS4" "GTA 6" OR "GTA6"'
+      - '"PS5 emulator" "GTA 6" OR "RAGE9"'
+      - '"Xbox Series" emulator "GTA 6" OR "scarlett"'
+      - '"d3d12_xs" OR "d3d12_xs.dll"'
+      - '"Neonbridge" OR "ScarlettPort" "GTA 6" OR "scarlett"'
+      - '"xgameruntime" "scarlett" OR "GTA 6"'
+      - '"Prospero" emulator "GNMX"'
+      - '"GTA6Recomp" OR "GTAVIRecomp"'
+      - '"GTA 6" "static recompilation"'
+      - '"GTA 6" "ghidra" OR "decompiler" OR "LLM4Decompile"'
+      # Pilier 2 : symbols.toml / mapping (game_scarlett_master.exe / eboot.bin) + RPF9
+      - '"game_scarlett_master.exe"'
+      - '"game_scarlett_master"'
+      - '"GTA 6" "symbols.toml"'
+      - '"GTA 6" "eboot.bin"'
+      - '"RPF9" "GTA 6" OR "GTA6"'
+      - '"RAGE9" "RPF9"'
+      - '"GTA 6" rpf9'
+      # Pilier 3 : Outils de dump / déchiffrement FSELF / ELF / RPF
+      - '"GTA 6" "ps5 dumper" OR "fself"'
+      - '"GTA6" "elf dump" OR "symbol dump"'
+      - '"RAGE9" dumper'
+    # GitHub Code Search (/search/code) ultra-ciblé sur les 3 piliers
+    code_queries:
+      - '"game_scarlett_master.exe"'
+      - '"game_scarlett_master"'
+      - 'filename:symbols.toml GTA6'
+      - '"RPF9" "GTA6"'
+      - '"RPF9" language:C++'
+      - '"libSce" "RAGE9"'
+      - '"fself" "GTA6"'
+      - '"elf2cpp" GTA6'
+      - '"d3d12_xs.dll"'
+      - '"d3d12_xs" language:C++'
+      - '"xgameruntime" "scarlett"'
+    watched_repos:
+      - "4lwayz/portwatch-vi"
+      - "Belobug/VIctory-Belobug-AMD"
+      - "DexNom/VIctory"
+      - "avatarmanz/VIctory-7900XTX"
+      - "Zettrox/ztrx"
+      - "uiliannn/VItoriaBr"
+      - "fxceless/victory-fork"
+      - "Marvisak/VIctory"
+      - "xcl-dev/xcl"
+      - "DesignWithTommy/Neonbridge"
+      - "realblastex/flamingo"
+      - "lynxnathan/rage-tools-vi"
+      - "breadbbbb/rpf9-explorer"
+      - "holdmysocks/SixNG"
+      - "nullbrik/RageForge"
+      - "pagiii/gta6-tracker"
+      - "Ahmet-Dedeler/awesome-gta6-reverse-engineering"
+      - "shadps4-emu/shadPS4"
+      - "InoriRus/Kyty"
+      - "dexyfex/CodeWalker"
+      - "hedge-dev/XenonRecomp"
+    # Filtre commits/PRs sur les gros émulateurs
+    watched_filter_terms:
+      - "RAGE"
+      - "RPF"
+      - "GTA"
+      - "PS5"
+      - "Prospero"
+      - "GNMX"
+      - "RPF9"
+      - "RAGE9"
+      - "Scarlett"
+      - "Xbox"
+      - "DX12"
+      - "d3d12_xs"
+      - "xgameruntime"
+      - "Neonbridge"
+      - "Flamingo"
+      - "VIctory"
+      - "VItoriaBr"
+    fetch_releases: true
+    fetch_commits: true
+    fetch_prs: true
+    max_commits_per_repo: 10
+
+  web_dork:
+    enabled: true
+    # Optionnel : URL d'une instance SearXNG (ex: "https://searx.be"). Si vide, utilise DuckDuckGo Search.
+    searxng_url: ""
+    max_results_per_dork: 8
+    max_dorks_per_cycle: 10
+    forum_sites:
+      - "gtaforums.com"
+      - "gbatemp.net"
+      - "reshax.com"
+      - "zenhax.com"
+      - "reddit.com"
+    host_sites:
+      - "archive.org"
+      - "gitlab.com"
+      - "codeberg.org"
+      - "huggingface.co"
+      - "gist.github.com"
+    custom_dorks:
+      - '"game_scarlett_master.exe" OR "game_scarlett_master"'
+      - '"game_scarlett_master" (decomp OR recomp OR symbols OR ghidra OR ida OR rpf OR dump)'
+      - '"GTA6Recomp" OR "GTAVIRecomp" OR ("GTA 6" "static recompilation")'
+      - '("GTA 6" OR "GTA6" OR "GTA VI") ("recomp" OR "decomp" OR "elf2cpp") "releases/download"'
+      - '("GTA 6" OR "GTA6" OR "RAGE9") (filetype:toml OR "symbols.toml" OR "recomp_config")'
+      - 'intitle:"index of" ("GTA6Recomp" OR "GTA6" OR "RAGE9" OR "game_scarlett_master") (recomp OR rpf OR elf OR sprx)'
+      - '("GTA 6" OR "GTA6") (filetype:7z OR filetype:zip) (recomp OR decomp OR rpf OR shadps4)'
+      - '("GTA 6" OR "GTA6" OR "RAGE9") ("elf dump" OR "symbol dump" OR "shader dump" OR "ps5 dumper" OR "fself")'
+      - '("d3d12_xs" OR "xgameruntime" OR "Neonbridge" OR "ScarlettPort") ("GTA 6" OR "GTA6" OR "scarlett" OR "Xbox Series")'
+
+  forums:
+    enabled: true
+    max_threads_per_cycle: 12
+    # URLs de threads ou sections techniques suivies directement en plus des threads découverts par Web Dorks
+    seed_urls:
+      - "https://portwatch-vi.xyz/"
+
+  alt_git:
+    enabled: true
+    gitlab_enabled: true
+    codeberg_enabled: true
+    huggingface_enabled: true
+    per_query_limit: 15
+    queries:
+      - "game_scarlett_master"
+      - "GTA6Recomp"
+      - "GTA6 recomp"
+      - "GTA 6 decomp"
+      - "GTA6 emulator"
+      - "RAGE9"
+      - "GTA6 rpf"
+      - "GTAVI port"
+      - "GTA6 dumper"
+      - "RAGE9 dump"
+      - "d3d12_xs"
+      - "Neonbridge"
+
+  reddit:
+    enabled: true
+    limit_per_subreddit: 25
+    max_pages_per_query: 2
+    sort: "new"
+    subreddits:
+      - "ReverseEngineering"
+      - "emulation"
+      - "Decomp"
+      - "shadps4"
+      - "GamingLeaksAndRumours"
+      - "GTA6"
+    search_queries:
+      - '("GTA 6" OR "GTA6" OR "GTA6Recomp" OR "RAGE 9" OR "game_scarlett_master") (recomp OR decomp OR port OR emulator OR shadps4 OR ps5 OR scarlett OR d3d12_xs OR neonbridge OR xgameruntime OR rpf OR elf2cpp OR dumper OR "elf dump" OR "symbol dump")'
+
+  rss:
+    enabled: true
+    arxiv:
+      enabled: true
+      max_results: 20
+      categories:
+        - "cs.SE"
+        - "cs.PL"
+        - "cs.CR"
+      queries:
+        - '("GTA 6" OR "GTA6" OR "Grand Theft Auto" OR "RAGE") AND (decompilation OR recompilation OR "binary translation")'
+    feeds:
+      - name: "Dolphin Emulator Blog"
+        url: "https://dolphin-emu.org/blog/feeds/"
+      - name: "RPCS3 Blog"
+        url: "https://rpcs3.net/blog/feed/"
+      - name: "Hex-Rays Blog"
+        url: "https://hex-rays.com/blog/feed/"
+      - name: "Trail of Bits Blog"
+        url: "https://blog.trailofbits.com/feed/"
+
+# Notifications & Exports
+notifications:
+  windows_toast_on_milestone: true
+  milestone_only_alerts: true
+  discord:
+    enabled: false
+    min_score: 55
+    max_items_per_run: 15
+  markdown:
+    enabled: true
+    min_score: 40

@@ -1,0 +1,2180 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SixDeck — Community Launcher</title>
+  <style>
+    :root {
+      --bg-dark: #0c0818;
+      --glass-side: rgba(14, 10, 26, 0.84);
+      --glass-panel: rgba(22, 15, 40, 0.78);
+      --glass-card: rgba(30, 20, 54, 0.72);
+      --border: rgba(255, 255, 255, 0.10);
+      --border-hi: rgba(244, 114, 182, 0.45);
+      --text: #f8fafc;
+      --muted: #c4b5d6;
+      --pink: #f43f8e;
+      --pink-soft: #f472b6;
+      --sunset: linear-gradient(90deg, #ff8a3d 0%, #f43f8e 55%, #a855f7 100%);
+      --cyan: #38bdf8;
+      --green: #34d399;
+      --amber: #fbbf24;
+      --red: #f87171;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+    body {
+      font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+      color: var(--text);
+      background:
+        linear-gradient(125deg, rgba(16, 8, 34, 0.74) 0%, rgba(44, 16, 62, 0.62) 55%, rgba(12, 8, 24, 0.82) 100%),
+        url("/assets/bg.png") center/cover no-repeat fixed,
+        var(--bg-dark);
+      overflow: hidden;
+      user-select: none;
+    }
+
+    .shell {
+      display: grid;
+      grid-template-columns: 204px minmax(0, 1fr);
+      height: 100vh;
+      transition: grid-template-columns .2s ease;
+    }
+    .shell.collapsed { grid-template-columns: 74px minmax(0, 1fr); }
+
+    /* Left Sidebar */
+    .sidebar {
+      background: var(--glass-side);
+      backdrop-filter: blur(18px);
+      border-right: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      padding: 22px 14px 16px;
+      user-select: none;
+    }
+    .logo-wrap {
+      display: flex; align-items: center; justify-content: center;
+      padding: 4px 6px 22px; cursor: pointer;
+    }
+    .logo-wrap img {
+      width: 64px; height: auto;
+      filter: drop-shadow(0 4px 16px rgba(244, 63, 142, 0.45));
+      transition: transform .2s;
+    }
+    .shell.collapsed .logo-wrap img { width: 42px; }
+    .logo-wrap:hover img { transform: scale(1.05); }
+
+    .nav-main { display: flex; flex-direction: column; gap: 6px; }
+    .nav-bottom { margin-top: auto; display: flex; flex-direction: column; gap: 8px; }
+    .nav-btn {
+      width: 100%;
+      background: transparent;
+      border: 1px solid transparent;
+      color: var(--muted);
+      padding: 11px 14px;
+      border-radius: 10px;
+      font-size: .95rem;
+      font-weight: 700;
+      letter-spacing: .2px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      cursor: pointer;
+      transition: all .16s ease;
+      white-space: nowrap;
+      overflow: hidden;
+      user-select: none;
+    }
+    .nav-btn:hover { color: #fff; background: rgba(255,255,255,.07); }
+    .nav-btn.active {
+      color: #fff;
+      background: linear-gradient(90deg, rgba(244, 63, 142, 0.30), rgba(168, 85, 247, 0.16));
+      border-color: var(--border-hi);
+      box-shadow: 0 4px 18px rgba(244, 63, 142, 0.22);
+    }
+    .nav-btn.dimmed { opacity: 0.42; }
+    .nav-btn.dimmed:hover { opacity: 0.82; }
+    .nav-btn.dimmed.active { opacity: 1; }
+    .nav-ico {
+      display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0;
+      width: 19px; height: 19px;
+    }
+    .nav-ico.collapsed-only { display: none; }
+    .shell.collapsed .nav-btn { justify-content: center; padding: 11px 0; }
+    .shell.collapsed .nav-label { display: none; }
+    .shell.collapsed .nav-ico.collapsed-only { display: inline-flex; }
+    .shell.collapsed .collapse-row { justify-content: center; padding: 8px 0 0; }
+    .collapse-row {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 8px 10px 0; border-top: 1px solid var(--border);
+    }
+    .collapse-btn {
+      background: transparent; border: 1px solid var(--border); color: var(--muted);
+      border-radius: 8px; width: 32px; height: 30px; cursor: pointer; font-size: .9rem;
+    }
+    .collapse-btn:hover { color: #fff; border-color: var(--pink-soft); }
+    .shell.collapsed .side-status { display: none; }
+
+    /* Main Stage */
+    .stage {
+      height: 100vh;
+      overflow-y: auto;
+      padding: 24px 30px 28px;
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+    }
+    .view { display: none; flex-direction: column; gap: 18px; flex: 1; }
+    .view.active { display: flex; }
+
+    /* Global Loader & Toasts */
+    @keyframes spin { to { transform: rotate(360deg); } }
+    @keyframes shimmer { 0% { transform: translateX(-100%); } 100% { transform: translateX(220%); } }
+    .spinner {
+      display: inline-block; width: 15px; height: 15px;
+      border: 2.5px solid rgba(255,255,255,.25); border-top-color: var(--pink-soft);
+      border-radius: 50%; animation: spin .75s linear infinite; flex-shrink: 0;
+    }
+    .loading-banner {
+      display: none; flex-direction: column; gap: 7px;
+      background: rgba(28, 16, 48, 0.92); backdrop-filter: blur(12px);
+      border: 1px solid var(--border-hi); border-radius: 12px; padding: 10px 14px;
+    }
+    .loading-banner.show { display: flex; }
+    .indet-track { position: relative; height: 4px; border-radius: 999px; background: rgba(255,255,255,.12); overflow: hidden; }
+    .indet-bar { position: absolute; inset: 0 auto 0 0; width: 42%; border-radius: 999px; background: var(--sunset); animation: shimmer 1.2s ease-in-out infinite; }
+    .toast-wrap { position: fixed; right: 20px; bottom: 20px; display: flex; flex-direction: column; gap: 8px; z-index: 90; pointer-events: none; }
+    .toast {
+      pointer-events: auto; background: rgba(22, 15, 40, 0.96); border: 1px solid var(--border-hi);
+      color: #fff; padding: 10px 15px; border-radius: 12px; font-size: .83rem; font-weight: 600;
+      box-shadow: 0 12px 32px rgba(0,0,0,.55); max-width: 390px;
+    }
+    .toast.ok { border-color: rgba(52,211,153,.6); }
+    .toast.err { border-color: rgba(248,113,113,.7); }
+
+    /* ================= 1. PLAY SCREEN ================= */
+    .play-layout {
+      display: grid;
+      grid-template-columns: minmax(290px, auto) minmax(0, 1fr);
+      gap: 28px;
+      align-items: center;
+      margin-top: auto;
+      margin-bottom: auto;
+    }
+    .hero-left {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 14px;
+    }
+    .hero-logo {
+      width: 144px; max-width: 100%; height: auto;
+      filter: drop-shadow(0 12px 28px rgba(0, 0, 0, 0.65));
+    }
+    .btn-play {
+      min-width: 248px;
+      padding: 14px 26px;
+      border: none;
+      border-radius: 8px;
+      background: #ffffff;
+      color: #140b24;
+      font-size: 1.05rem;
+      font-weight: 900;
+      letter-spacing: 1.2px;
+      text-transform: uppercase;
+      cursor: pointer;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+      transition: transform .14s, box-shadow .14s;
+    }
+    .btn-play:hover { transform: translateY(-2px); box-shadow: 0 14px 36px rgba(244, 63, 142, 0.35); }
+    .btn-play.update {
+      background: var(--sunset);
+      color: #fff;
+      box-shadow: 0 10px 30px rgba(244, 63, 142, 0.45);
+    }
+    .btn-play.stop {
+      background: linear-gradient(90deg, #ef4444 0%, #f43f5e 100%);
+      color: #fff;
+      box-shadow: 0 10px 30px rgba(239, 68, 68, 0.5);
+    }
+    .live-pill {
+      display: none;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 12px;
+      border-radius: 999px;
+      background: rgba(16, 185, 129, 0.16);
+      border: 1px solid rgba(52, 211, 153, 0.45);
+      color: #a7f3d0;
+      font-size: .78rem;
+      font-weight: 800;
+      width: max-content;
+    }
+    .ctrl-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+      margin-top: 10px;
+    }
+    .ctrl-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 7px 10px;
+      border-radius: 8px;
+      background: rgba(255,255,255,.04);
+      border: 1px solid var(--border);
+      font-size: .8rem;
+    }
+    .ctrl-key {
+      padding: 2px 7px;
+      border-radius: 5px;
+      background: rgba(244,114,182,.18);
+      border: 1px solid rgba(244,114,182,.4);
+      color: #fbcfe8;
+      font-family: Consolas, monospace;
+      font-weight: 800;
+      font-size: .75rem;
+    }
+    /* Auto-adapting meta widget (never wraps Version label or number!) */
+    .meta-box {
+      min-width: 248px;
+      width: max-content;
+      max-width: 360px;
+      background: var(--glass-panel);
+      backdrop-filter: blur(12px);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 11px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 9px;
+      font-size: .82rem;
+    }
+    .meta-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 14px;
+      white-space: nowrap;
+    }
+    .meta-row .muted { white-space: nowrap; flex-shrink: 0; }
+    .meta-row b { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .meta-row select {
+      background: rgba(12, 8, 24, 0.85); color: #fff; border: 1px solid var(--border);
+      border-radius: 6px; padding: 4px 8px; font-size: .8rem; max-width: 190px;
+    }
+
+    /* News Carousel */
+    .news-strip-wrap { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+    .news-strip-head {
+      display: flex; justify-content: space-between; align-items: center; gap: 10px;
+      font-size: .78rem; text-transform: uppercase; letter-spacing: 1.1px; color: var(--muted); font-weight: 800;
+    }
+    .news-nav-btn {
+      background: rgba(22, 15, 40, 0.85); border: 1px solid var(--border); color: var(--text);
+      width: 26px; height: 24px; border-radius: 6px; cursor: pointer; font-weight: 900; font-size: .95rem;
+      display: inline-flex; align-items: center; justify-content: center; transition: all .15s;
+    }
+    .news-nav-btn:hover { border-color: var(--pink-soft); color: #fff; background: rgba(244,63,142,.22); }
+    .news-strip {
+      display: flex; gap: 14px; overflow-x: auto; padding: 2px 2px 10px; scroll-snap-type: x mandatory;
+      scroll-behavior: smooth;
+    }
+    .news-strip::-webkit-scrollbar { height: 6px; }
+    .news-strip::-webkit-scrollbar-thumb { background: rgba(244,114,182,.35); border-radius: 999px; }
+    .news-card {
+      position: relative; overflow: hidden;
+      flex: 0 0 278px; scroll-snap-align: start;
+      background: var(--glass-panel); backdrop-filter: blur(14px);
+      border: 1px solid var(--border); border-radius: 13px; padding: 16px 15px 13px;
+      display: flex; flex-direction: column; justify-content: space-between; gap: 10px;
+      min-height: 196px; cursor: pointer; transition: transform .16s, border-color .16s, box-shadow .16s;
+    }
+    .news-card::before {
+      content: ""; position: absolute; top: 0; left: 0; right: 0; height: 3px;
+      background: var(--sunset); opacity: .75;
+    }
+    .news-card:hover { transform: translateY(-3px); border-color: var(--pink-soft); box-shadow: 0 12px 28px rgba(0,0,0,.38); }
+    .news-card.flash { border-color: rgba(251,191,36,.55); background: linear-gradient(155deg, rgba(251,191,36,.17), rgba(28,18,50,.88)); }
+    .news-card.flash::before { background: linear-gradient(90deg, #fbbf24, #f97316); opacity: 1; }
+    .news-title {
+      font-weight: 800; font-size: .92rem; line-height: 1.32; color: #fff;
+      display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+    }
+    .news-dek {
+      font-size: .78rem; color: var(--muted); line-height: 1.45;
+      display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
+    }
+    .news-foot {
+      display: flex; justify-content: flex-end; align-items: center;
+      font-size: .73rem; font-weight: 700; color: var(--pink-soft); padding-top: 4px;
+      border-top: 1px solid rgba(255,255,255,.06);
+    }
+
+    /* Dump Import Banner & Legal Footer */
+    .dump-banner {
+      display: flex; align-items: center; justify-content: space-between; gap: 12px;
+      width: 100%; max-width: 360px; padding: 10px 12px; border-radius: 10px;
+      background: rgba(251, 191, 36, 0.13); border: 1px solid rgba(251, 191, 36, 0.48);
+    }
+    .legal-bar {
+      margin-top: auto; padding-top: 8px; border-top: 1px solid rgba(255,255,255,.07);
+      display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px;
+      font-size: .72rem; color: rgba(196, 181, 214, 0.8);
+    }
+    .set-section {
+      padding: 8px 15px; font-size: .7rem; font-weight: 900; letter-spacing: 1.1px;
+      text-transform: uppercase; color: var(--pink-soft);
+      background: rgba(255,255,255,.03); border-bottom: 1px solid var(--border);
+    }
+
+    /* ================= ONLINE TAB ================= */
+    .coming-soon-wrap {
+      display: flex; align-items: center; justify-content: center; position: relative;
+      padding: 26px 12px 14px; text-align: center;
+    }
+    .coming-soon-title {
+      margin: 0; font-size: 2.75rem; font-weight: 900; letter-spacing: 1px;
+      background: linear-gradient(90deg, #ffffff 10%, #fbcfe8 55%, #f472b6 100%);
+      -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+      filter: drop-shadow(0 6px 24px rgba(244, 63, 142, 0.28));
+    }
+    .coming-soon-refresh {
+      position: absolute; right: 0; top: 8px;
+    }
+    .tweet-grid {
+      display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 13px;
+    }
+    .tweet-card {
+      background: rgba(16, 13, 28, 0.9); border: 1px solid var(--border);
+      border-radius: 14px; padding: 14px 15px; display: flex; flex-direction: column; gap: 10px;
+      transition: transform .15s, border-color .15s;
+    }
+    .tweet-card:hover { transform: translateY(-2px); border-color: rgba(56, 189, 248, 0.55); }
+    .tweet-head {
+      display: flex; justify-content: space-between; align-items: center; gap: 8px;
+    }
+    .tweet-avatar {
+      width: 30px; height: 30px; border-radius: 50%;
+      background: linear-gradient(135deg, #1d9bf0, #a855f7);
+      display: grid; place-items: center; font-weight: 900; font-size: .78rem; color: #fff; flex-shrink: 0;
+    }
+    .video-preview-box {
+      display: flex; align-items: center; gap: 12px; padding: 12px 14px; border-radius: 11px;
+      background: linear-gradient(135deg, rgba(244,63,142,0.18), rgba(14,10,28,0.92));
+      border: 1px solid rgba(244,114,182,0.38); color: #fff; text-decoration: none;
+      transition: border-color .15s, background .15s;
+    }
+    .video-preview-box:hover {
+      text-decoration: none; border-color: var(--pink-soft);
+      background: linear-gradient(135deg, rgba(244,63,142,0.3), rgba(24,14,44,0.95));
+    }
+    .video-play-circle {
+      width: 38px; height: 38px; border-radius: 50%; flex-shrink: 0;
+      background: var(--sunset); display: grid; place-items: center;
+      box-shadow: 0 4px 16px rgba(244,63,142,0.45);
+    }
+    .online-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(310px, 1fr));
+      gap: 13px;
+    }
+    .online-card {
+      position: relative; overflow: hidden;
+      background: rgba(24, 16, 44, 0.86); border: 1px solid var(--border);
+      border-radius: 13px; padding: 15px 15px 12px;
+      display: flex; flex-direction: column; justify-content: space-between; gap: 10px;
+      min-height: 162px; cursor: pointer; transition: transform .15s, border-color .15s;
+    }
+    .online-card::before {
+      content: ""; position: absolute; top: 0; left: 0; right: 0; height: 3px;
+      background: var(--sunset); opacity: .7;
+    }
+    .online-card.hl { border-color: rgba(251, 191, 36, 0.55); background: linear-gradient(155deg, rgba(251,191,36,.14), rgba(26,17,46,.9)); }
+    .online-card.hl::before { background: linear-gradient(90deg, #fbbf24, #f97316); opacity: 1; }
+    .online-card:hover { transform: translateY(-2px); border-color: var(--pink-soft); }
+    .src-pills { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+    .src-pill {
+      display: inline-flex; align-items: center; gap: 4px;
+      padding: 3px 8px; border-radius: 999px; font-size: .71rem; font-weight: 700;
+      background: rgba(56,189,248,.14); border: 1px solid rgba(56,189,248,.35); color: #7dd3fc;
+    }
+    .src-pill:hover { background: rgba(56,189,248,.26); text-decoration: none; }
+    .mod-search {
+      background: rgba(12, 8, 24, 0.8); border: 1px solid var(--border); color: #fff;
+      border-radius: 999px; padding: 6px 12px; font-size: .78rem; outline: none; width: 195px;
+    }
+    .mod-search:focus { border-color: var(--pink-soft); }
+
+    /* Shared Components */
+    .panel {
+      background: var(--glass-panel); backdrop-filter: blur(16px);
+      border: 1px solid var(--border); border-radius: 14px; padding: 16px 18px;
+    }
+    .page-head { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between; }
+    .page-head h1 { margin: 0; font-size: 1.4rem; font-weight: 900; letter-spacing: .3px; }
+    .muted { color: var(--muted); font-size: .8rem; }
+
+    .btn {
+      border: 1px solid var(--border); background: rgba(34, 22, 60, 0.85); color: #fff;
+      padding: 8px 13px; border-radius: 8px; font-size: .8rem; font-weight: 700; cursor: pointer;
+      transition: all .15s;
+    }
+    .btn:hover { border-color: var(--pink-soft); background: rgba(54, 32, 92, 0.9); }
+    .btn.primary { background: var(--sunset); border: none; }
+    .btn.safe { background: rgba(16,185,129,.22); border-color: rgba(52,211,153,.5); color: #6ee7b7; }
+    .btn.sm { padding: 5px 10px; font-size: .75rem; }
+
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: .7rem; font-weight: 800; }
+    .b-ok { background: rgba(52,211,153,.18); color: var(--green); border: 1px solid rgba(52,211,153,.4); }
+    .b-upd { background: rgba(251,146,60,.2); color: #fdba74; border: 1px solid rgba(251,146,60,.5); }
+    .b-miss { background: rgba(248,113,113,.18); color: #fca5a5; border: 1px solid rgba(248,113,113,.4); }
+    .b-pink { background: rgba(244,63,142,.22); color: #f9a8d4; border: 1px solid rgba(244,114,182,.45); }
+
+    .switch { position: relative; display: inline-block; width: 42px; height: 22px; flex-shrink: 0; }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .slider { position: absolute; inset: 0; cursor: pointer; border-radius: 999px; background: rgba(255,255,255,.18); transition: .2s; }
+    .slider:before { content: ""; position: absolute; height: 16px; width: 16px; left: 3px; bottom: 3px; background: #fff; border-radius: 50%; transition: .2s; }
+    .switch input:checked + .slider { background: var(--pink); }
+    .switch input:checked + .slider.green { background: #22c55e; }
+    .switch input:checked + .slider:before { transform: translateX(20px); }
+
+    /* ================= 2. MODS (with Preview Images!) ================= */
+    .mod-row {
+      display: grid;
+      grid-template-columns: 56px 68px minmax(0, 1fr) 95px 80px 52px;
+      gap: 10px;
+      align-items: center;
+      padding: 9px 10px;
+      border-bottom: 1px solid var(--border);
+      font-size: .83rem;
+    }
+    .mod-row:last-child { border-bottom: none; }
+    .mod-thumb {
+      width: 64px; height: 36px; border-radius: 7px; object-fit: cover;
+      border: 1px solid var(--border); background: linear-gradient(135deg,#3b1d5e,#1a1030);
+    }
+    .workshop-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(215px, 1fr));
+      gap: 12px;
+    }
+    .ws-card {
+      border-radius: 12px; overflow: hidden;
+      border: 1px solid var(--border);
+      display: flex; flex-direction: column;
+      background: rgba(24, 16, 44, 0.88);
+      transition: transform .15s, border-color .15s;
+    }
+    .ws-card:hover { transform: translateY(-2px); border-color: var(--pink-soft); }
+    .ws-img-wrap {
+      position: relative; width: 100%; height: 104px; overflow: hidden;
+    }
+    .ws-img-wrap img {
+      width: 100%; height: 100%; object-fit: cover; display: block;
+    }
+    .ws-body {
+      padding: 11px 12px 12px; display: flex; flex-direction: column; justify-content: space-between; gap: 8px; flex: 1;
+    }
+
+    /* ================= 3. COMPONENTS ================= */
+    .seg-group {
+      display: inline-flex; background: rgba(12,8,24,.7); border: 1px solid var(--border);
+      border-radius: 999px; padding: 3px; gap: 3px;
+    }
+    .seg-btn {
+      border: none; background: transparent; color: var(--muted);
+      padding: 5px 11px; border-radius: 999px; font-size: .76rem; font-weight: 700; cursor: pointer;
+    }
+    .seg-btn.active { background: var(--sunset); color: #fff; }
+
+    .dl-item {
+      display: grid;
+      grid-template-columns: minmax(0, 1.2fr) minmax(0, 1.4fr) 165px 185px;
+      gap: 12px; align-items: center; padding: 12px 15px; border-bottom: 1px solid var(--border);
+    }
+    .dl-item:last-child { border-bottom: none; }
+    .prog-track { height: 6px; border-radius: 999px; background: rgba(255,255,255,.1); overflow: hidden; margin-top: 6px; }
+    .prog-fill { height: 100%; border-radius: 999px; background: var(--sunset); }
+    .prog-fill.ok { background: var(--green); }
+
+    /* ================= 4. SETTINGS ================= */
+    .settings-grid {
+      display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(240px, 0.85fr); gap: 18px; align-items: start;
+    }
+    .set-row {
+      display: flex; align-items: center; justify-content: space-between; gap: 12px;
+      padding: 12px 15px; border-bottom: 1px solid var(--border); transition: background .12s;
+    }
+    .set-row:hover { background: rgba(244, 63, 142, 0.14); }
+    .set-row:last-child { border-bottom: none; }
+    .set-name { font-weight: 700; font-size: .9rem; }
+    .stepper {
+      display: inline-flex; align-items: center; gap: 10px;
+      background: rgba(12, 8, 24, 0.65); border: 1px solid var(--border);
+      border-radius: 8px; padding: 4px 10px; font-weight: 700; font-size: .83rem;
+    }
+    .stepper button { background: transparent; border: none; color: var(--pink-soft); font-weight: 900; font-size: .95rem; cursor: pointer; padding: 0 4px; }
+    .stepper button:hover { color: #fff; }
+    .set-help-box {
+      background: var(--glass-panel); backdrop-filter: blur(16px);
+      border: 1px solid var(--border); border-radius: 14px; padding: 18px; min-height: 220px;
+    }
+    .set-help-title { font-size: .85rem; font-weight: 900; text-transform: uppercase; letter-spacing: 1px; color: var(--pink-soft); margin-bottom: 8px; }
+    .logbox {
+      background: rgba(8, 5, 16, 0.85); border: 1px solid var(--border); border-radius: 10px;
+      padding: 12px; font-family: Consolas, monospace; font-size: .76rem; max-height: 170px;
+      overflow-y: auto; white-space: pre-wrap; color: #e2e8f0;
+      user-select: text; -webkit-user-select: text;
+    }
+    .chk-PASS { color: var(--green); font-weight: 800; }
+    .chk-WARN { color: var(--amber); font-weight: 800; }
+    .chk-FAIL { color: var(--red); font-weight: 800; }
+
+    table { width: 100%; border-collapse: collapse; font-size: .8rem; }
+    th, td { padding: 8px 9px; border-bottom: 1px solid var(--border); text-align: left; }
+    th { color: var(--muted); font-size: .71rem; text-transform: uppercase; }
+    a { color: var(--cyan); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    /* Modal */
+    /* Startup Splash Overlay (Sober Logo on Gradient) */
+    @keyframes splashFloat {
+      0%, 100% { transform: translateY(0px) scale(1); }
+      50% { transform: translateY(-6px) scale(1.02); }
+    }
+    @keyframes splashGlow {
+      0%, 100% { opacity: .42; transform: scale(.96); }
+      50% { opacity: .78; transform: scale(1.06); }
+    }
+    .splash-overlay {
+      position: fixed; inset: 0; z-index: 200;
+      display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 22px;
+      background:
+        radial-gradient(circle at 50% 44%, rgba(244, 63, 142, 0.22) 0%, rgba(168, 85, 247, 0.12) 34%, transparent 64%),
+        linear-gradient(135deg, #0a0616 0%, #1c0c30 48%, #311038 78%, #0d081b 100%);
+      transition: opacity .48s ease, transform .48s ease;
+    }
+    .splash-overlay.hidden {
+      opacity: 0; transform: scale(1.025); pointer-events: none;
+    }
+    .splash-logo-wrap {
+      position: relative; display: flex; align-items: center; justify-content: center;
+    }
+    .splash-aura {
+      position: absolute; width: 170px; height: 170px; border-radius: 50%;
+      background: radial-gradient(circle, rgba(244, 63, 142, 0.48), rgba(168, 85, 247, 0.22) 55%, transparent 74%);
+      filter: blur(20px); animation: splashGlow 3.2s ease-in-out infinite;
+    }
+    .splash-logo {
+      position: relative; width: 132px; height: auto;
+      filter: drop-shadow(0 10px 28px rgba(0, 0, 0, 0.65));
+      animation: splashFloat 3.2s ease-in-out infinite;
+    }
+    .splash-track {
+      position: relative; width: 210px; height: 3px; border-radius: 999px;
+      background: rgba(255, 255, 255, 0.12); overflow: hidden;
+    }
+    .splash-bar {
+      position: absolute; inset: 0 auto 0 0; width: 42%; border-radius: 999px;
+      background: var(--sunset); animation: shimmer 1.35s ease-in-out infinite;
+    }
+    .splash-stage {
+      font-size: .79rem; font-weight: 600; letter-spacing: .35px; color: rgba(226, 214, 240, 0.85);
+    }
+
+    /* Crash Modal */
+    .crash-textarea {
+      width: 100%; height: 290px; resize: vertical;
+      background: #080511; color: #f1f5f9;
+      border: 1px solid rgba(248, 113, 113, 0.45); border-radius: 10px;
+      padding: 11px 12px; font-family: Consolas, "Cascadia Mono", monospace; font-size: .75rem;
+      line-height: 1.48; outline: none;
+      user-select: text !important; -webkit-user-select: text !important;
+    }
+    .crash-textarea:focus { border-color: var(--red); }
+
+    .modal-bg {
+      position: fixed; inset: 0; background: rgba(7, 4, 15, 0.8); backdrop-filter: blur(8px);
+      display: none; align-items: center; justify-content: center; z-index: 80; padding: 18px;
+    }
+    .modal-bg.open { display: flex; }
+    .modal {
+      background: #160f29; border: 1px solid var(--border-hi); border-radius: 16px;
+      width: 100%; max-width: 660px; max-height: 84vh; overflow-y: auto; padding: 18px 20px;
+      box-shadow: 0 24px 60px rgba(0,0,0,.65);
+    }
+    .commit-row { padding: 8px 10px; background: rgba(255,255,255,.04); border: 1px solid var(--border); border-radius: 9px; margin-bottom: 6px; font-size: .79rem; }
+  </style>
+</head>
+<body>
+<!-- STARTUP SPLASH OVERLAY -->
+<div id="splashOverlay" class="splash-overlay">
+  <div class="splash-logo-wrap">
+    <div class="splash-aura"></div>
+    <img class="splash-logo" src="/assets/logo.svg" alt="VI" />
+  </div>
+  <div class="splash-track"><div class="splash-bar"></div></div>
+  <div id="splashStage" class="splash-stage">Syncing latest GitHub &amp; PortWatch releases...</div>
+</div>
+
+<div id="appShell" class="shell">
+  <!-- LEFT SIDEBAR -->
+  <aside class="sidebar">
+    <div class="logo-wrap" onclick="switchView('play')" title="SixDeck">
+      <img src="/assets/logo.svg" alt="VI" />
+    </div>
+
+    <nav class="nav-main">
+      <button class="nav-btn active" data-view="play" title="Play" onclick="switchView('play')">
+        <span class="nav-ico"><svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><polygon points="6,4 20,12 6,20"/></svg></span>
+        <span class="nav-label">Play</span>
+      </button>
+      <button class="nav-btn" data-view="mods" title="Mods" onclick="switchView('mods')">
+        <span class="nav-ico collapsed-only"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4a2 2 0 1 1 4 0v2h2a1 1 0 0 1 1 1v4h-2a2 2 0 1 0 0 4h2v4a1 1 0 0 1-1 1h-4v-2a2 2 0 1 0-4 0v2H5a1 1 0 0 1-1-1v-4h2a2 2 0 1 0 0-4H4V7a1 1 0 0 1 1-1h5V4a2 2 0 1 1 4 0z"/></svg></span>
+        <span class="nav-label">Mods</span>
+      </button>
+      <button class="nav-btn" data-view="components" title="Components" onclick="switchView('components')">
+        <span class="nav-ico collapsed-only"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 12 12 17 22 12"/><polyline points="2 17 12 22 22 17"/></svg></span>
+        <span class="nav-label">Components</span>
+      </button>
+      <button class="nav-btn dimmed" data-view="online" title="Online (Coming Soon)" onclick="switchView('online')">
+        <span class="nav-ico collapsed-only"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><line x1="3" y1="12" x2="21" y2="12"/><path d="M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></svg></span>
+        <span class="nav-label">Online</span>
+      </button>
+    </nav>
+
+    <div class="nav-bottom">
+      <button class="nav-btn" data-view="settings" title="Settings" onclick="switchView('settings')">
+        <span class="nav-ico"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c.26.6.85 1 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></span>
+        <span class="nav-label">Settings</span>
+      </button>
+      <div class="collapse-row">
+        <button class="collapse-btn" title="Collapse / Expand sidebar" onclick="document.getElementById('appShell').classList.toggle('collapsed')">◧</button>
+        <span id="sideStatusDot" class="side-status" style="font-size:.73rem;color:var(--green);display:none"></span>
+      </div>
+    </div>
+  </aside>
+
+  <!-- MAIN STAGE -->
+  <main class="stage">
+    <div id="loadingBanner" class="loading-banner">
+      <div style="display:flex;align-items:center;gap:10px;font-size:.83rem;font-weight:700">
+        <span class="spinner"></span><span id="loadingText">Working...</span>
+      </div>
+      <div class="indet-track"><div class="indet-bar"></div></div>
+    </div>
+
+    <!-- ==================== 1. PLAY ==================== -->
+    <section id="view-play" class="view active">
+      <div class="play-layout">
+        <div class="hero-left">
+          <img class="hero-logo" src="/assets/logo.svg" alt="SixDeck" />
+          <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+            <button id="btnMainPlay" class="btn-play" onclick="onMainPlayClick()">PLAY</button>
+          </div>
+          <div id="playLivePill" class="live-pill">
+            <span id="playLiveFps">🟢 Running</span>
+            <span id="playLiveErr" class="badge b-miss" style="display:none">0 err</span>
+          </div>
+          <a id="linkPlayAnyway" href="#" style="display:none;font-size:.78rem;color:#e2e8f0" onclick="playNow(); return false;">Launch without updating ›</a>
+
+          <div id="importDumpBanner" class="dump-banner" style="display:none">
+            <div>
+              <div style="font-weight:800;font-size:.82rem;color:#fde68a">⚠️ Local Dump Required</div>
+              <div class="muted" style="font-size:.73rem;margin-top:2px">Import your own dump folder (<code>game_scarlett_master.exe</code>) to launch.</div>
+            </div>
+            <button class="btn sm primary" onclick="pickGameDir()">📂 Import</button>
+          </div>
+
+          <div class="meta-box">
+            <div class="meta-row">
+              <span class="muted">Version:</span>
+              <b id="playVersion">—</b>
+            </div>
+            <div class="meta-row">
+              <span class="muted">Runtime:</span>
+              <select id="selRuntime" onchange="saveSetting('selected_runtime', this.value)"></select>
+            </div>
+            <div class="meta-row">
+              <span class="muted">GPU / RAM:</span>
+              <div style="display:flex;align-items:center;gap:6px">
+                <span id="playGpuBadge" class="badge b-ok">NVIDIA</span>
+                <span id="playRamBadge" class="badge b-ok" title="Free System RAM">— GB free</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="news-strip-wrap">
+          <div class="news-strip-head">
+            <div style="display:flex;align-items:center;gap:8px">
+              <span>Community News &amp; Flash</span>
+              <span id="newsCountBadge" class="badge b-pink">0</span>
+            </div>
+            <div style="display:flex;align-items:center;gap:6px">
+              <button class="news-nav-btn" onclick="scrollNews(-1)" title="Previous news">‹</button>
+              <button class="news-nav-btn" onclick="scrollNews(1)" title="Next news">›</button>
+              <a href="https://portwatch-vi.xyz/#top" target="_blank" style="font-size:.74rem;margin-left:4px;text-transform:none;letter-spacing:0">PortWatch VI ↗</a>
+            </div>
+          </div>
+          <div id="newsStrip" class="news-strip"></div>
+        </div>
+      </div>
+
+      <div class="legal-bar">
+        <span>SixDeck · Independent community project · Not affiliated with PortWatch VI, Rockstar Games, or Take-Two · No game files provided.</span>
+        <a href="#" onclick="openLegalModal(); return false;" style="font-weight:700">⚖️ Legal Notice ›</a>
+      </div>
+    </section>
+
+    <!-- ==================== 1.5 ONLINE ==================== -->
+    <section id="view-online" class="view">
+      <div class="coming-soon-wrap">
+        <h1 class="coming-soon-title">Coming Soon...</h1>
+        <button class="btn sm coming-soon-refresh" onclick="syncOnlineNews()" title="Refresh Tweets &amp; Articles">🔄 Refresh</button>
+      </div>
+
+      <div class="panel">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+          <h2 style="margin:0;font-size:.96rem">𝕏 Tweets &amp; Video Clips (<span id="onlineTweetCount">0</span>)</h2>
+          <span class="muted">Community demos &amp; verified video posts</span>
+        </div>
+        <div id="onlineTweetsGrid" class="tweet-grid"></div>
+      </div>
+
+      <div class="panel">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+          <h2 style="margin:0;font-size:.96rem">🎬 Articles &amp; Video Reports (<span id="onlineNewsCount">0</span>)</h2>
+          <span class="muted">Click any card to read the full report or open the video source</span>
+        </div>
+        <div id="onlineNewsGrid" class="online-grid"></div>
+      </div>
+    </section>
+
+    <!-- ==================== 2. MODS ==================== -->
+    <section id="view-mods" class="view">
+      <div class="page-head">
+        <h1>Mods</h1>
+        <div style="display:flex;gap:12px;align-items:center">
+          <label style="display:flex;align-items:center;gap:8px;font-size:.83rem;font-weight:700;cursor:pointer">
+            <span>Vanilla Mode (no mods)</span>
+            <span class="switch"><input id="chkVanilla" type="checkbox" onchange="saveSetting('vanilla_mode', this.checked)" /><span class="slider"></span></span>
+          </label>
+          <button class="btn sm" onclick="modsAction('open-folder')">📁 Open Mods Folder</button>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+          <h2 style="margin:0;font-size:.98rem">Installed (<span id="modsInstalledCount">0</span>)</h2>
+          <span class="muted">Load order ↑ ↓ · Toggle ON/OFF without touching original dump files</span>
+        </div>
+        <div id="modsInstalledList"></div>
+      </div>
+
+      <div class="panel">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px">
+          <div>
+            <h2 style="margin:0;font-size:.98rem">Workshop — Open-Source Sources &amp; Tools (<span id="wsCount">0</span>)</h2>
+            <span class="muted">Curated GitHub + live PortWatch VI sources · Automatic Windows Defender scan on install</span>
+          </div>
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <div class="seg-group">
+              <button class="seg-btn active" data-modcat="all" onclick="setModCat('all')">All</button>
+              <button class="seg-btn" data-modcat="Archives / RPF9" onclick="setModCat('Archives / RPF9')">Archives</button>
+              <button class="seg-btn" data-modcat="Textures & Shaders" onclick="setModCat('Textures & Shaders')">Textures</button>
+              <button class="seg-btn" data-modcat="Models & Map" onclick="setModCat('Models & Map')">Models &amp; Map</button>
+              <button class="seg-btn" data-modcat="Audio & Scripts" onclick="setModCat('Audio & Scripts')">Audio &amp; Scripts</button>
+            </div>
+            <input id="modSearch" class="mod-search" type="text" placeholder="Filter sources..." oninput="renderWorkshop()" />
+          </div>
+        </div>
+        <div id="workshopGrid" class="workshop-grid"></div>
+      </div>
+    </section>
+
+    <!-- ==================== 3. COMPONENTS ==================== -->
+    <section id="view-components" class="view">
+      <div class="page-head">
+        <div>
+          <h1>Components</h1>
+          <div id="compConfigLine" class="muted">Config: NVIDIA · PortWatch VI + Tracker</div>
+        </div>
+        <div style="display:flex;flex-wrap:wrap;gap:7px;align-items:center">
+          <div class="seg-group">
+            <button class="seg-btn active" data-track="all" onclick="setTrack('all')">All</button>
+            <button class="seg-btn" data-track="recomp" onclick="setTrack('recomp')">PC Recomp</button>
+            <button class="seg-btn" data-track="xbox" onclick="setTrack('xbox')">Xbox Emu</button>
+            <button class="seg-btn" data-track="ps5" onclick="setTrack('ps5')">PS5 Emu</button>
+          </div>
+          <button class="btn sm primary" onclick="updateAllPillars()">⬆️ Update All</button>
+          <button class="btn sm" onclick="checkUpdatesNow()">🔍 Check Updates</button>
+          <button id="btnWatchToggle" class="btn sm" onclick="toggleWatch()">▶ Watch</button>
+        </div>
+      </div>
+
+      <div class="panel" style="padding:0;overflow:hidden">
+        <div style="padding:11px 15px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center">
+          <b>Pillars &amp; Components (Updates &amp; Rollback N-1)</b>
+          <span class="muted">Click "Diff &amp; Update" to compare versions before installing</span>
+        </div>
+        <div id="compList"></div>
+      </div>
+
+      <div class="panel">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+          <h2 style="margin:0;font-size:.98rem">🏆 PortWatch VI Live Leaderboard (<span id="pwCount">0</span> builds)</h2>
+          <button class="btn sm" onclick="syncPortWatch()">🔄 Sync PortWatch</button>
+        </div>
+        <div style="overflow-x:auto">
+          <table>
+            <thead>
+              <tr><th>#</th><th>Project</th><th>GPU</th><th>Progress</th><th>FPS / Render</th><th>Status</th><th>Action</th></tr>
+            </thead>
+            <tbody id="pwBoardTbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== 4. SETTINGS ==================== -->
+    <section id="view-settings" class="view">
+      <div class="page-head">
+        <h1>Settings</h1>
+        <span class="muted">Startup updates, graphics, controls, local dump, saves &amp; legal notice</span>
+      </div>
+
+      <div class="settings-grid">
+        <div class="panel" style="padding:0;overflow:hidden">
+          <div class="set-section">Startup &amp; Updates</div>
+
+          <div class="set-row" onmouseenter="setHelp('Check Updates on Startup','When enabled, the launcher checks PortWatch VI on startup and switches the PLAY button to UPDATE only if newer critical component updates are not yet downloaded. When disabled, PLAY stays ready by default.')">
+            <div style="min-width:0;flex:1">
+              <div class="set-name">Check Updates on Startup</div>
+              <div id="updCheckDetail" class="muted" style="font-size:.74rem">Not checked yet — PLAY stays default</div>
+            </div>
+            <div style="display:flex;gap:8px;align-items:center">
+              <button class="btn sm" onclick="checkUpdatesNow()">🔍 Check Now</button>
+              <label class="switch"><input id="chkUpdatesStartup" type="checkbox" onchange="saveSetting('check_updates_on_startup', this.checked)" /><span class="slider"></span></label>
+            </div>
+          </div>
+
+          <div class="set-row" onmouseenter="setHelp('Auto-Update Pillars','Automatically downloads and replaces GPU-compatible Pillar components during live watch cycles (keeps N-1 backup for Rollback).')">
+            <span class="set-name">Auto-Update Pillars (Watch)</span>
+            <label class="switch"><input id="chkAutoDl" type="checkbox" onchange="saveSetting('auto_download_enabled', this.checked)" /><span class="slider"></span></label>
+          </div>
+
+          <div class="set-row" onmouseenter="setHelp('Silent Watch (Windows Task)','Schedules a quiet background scan every hour (even when the launcher is closed) with Windows Toast alerts on major milestones only.')">
+            <div>
+              <div class="set-name">Silent Watch (Windows)</div>
+              <div class="muted">Scheduled task: <b id="schtaskState">—</b></div>
+            </div>
+            <div style="display:flex;gap:6px">
+              <button class="btn sm safe" onclick="silentAction('install_task')">Enable (1h)</button>
+              <button class="btn sm" onclick="silentAction('remove_task')">Disable</button>
+            </div>
+          </div>
+
+          <div class="set-section">Graphics &amp; Performance</div>
+
+          <div class="set-row" onmouseenter="setHelp('FPS Limit','Sets the frame rate cap passed to your active launch profile (30, 60, 120, 144, or Unlimited). Synced with VICTORY_FRAME_INTERVAL_MS on cool_fox.')">
+            <span class="set-name">FPS Limit</span>
+            <div class="stepper">
+              <button onclick="stepSetting('fps_limit', ['30','60','120','144','Unlimited'], -1)">‹</button>
+              <span id="valFps">60</span>
+              <button onclick="stepSetting('fps_limit', ['30','60','120','144','Unlimited'], 1)">›</button>
+            </div>
+          </div>
+
+          <div class="set-row" onmouseenter="setHelp('Output Resolution','Sets VICTORY_OUTPUT and VICTORY_DISPLAY_MODE for direct runtimes (lower resolution improves FPS and reduces VRAM usage on 8 GB GPUs).')">
+            <span class="set-name">Resolution</span>
+            <div class="stepper">
+              <button onclick="stepSetting('resolution', ['1280x720','1600x900','1920x1080','2560x1440'], -1)">‹</button>
+              <span id="valRes">1920x1080</span>
+              <button onclick="stepSetting('resolution', ['1280x720','1600x900','1920x1080','2560x1440'], 1)">›</button>
+            </div>
+          </div>
+
+          <div class="set-row" onmouseenter="setHelp('Render Scale','Internal resolution scaling passed via VICTORY_RENDER_SCALE (67%–100%). Lowering to 75% or 67% helps 16 GB RAM / 8 GB VRAM systems.')">
+            <span class="set-name">Render Scale</span>
+            <div class="stepper">
+              <button onclick="stepSetting('render_scale', ['0.667','0.75','0.85','1.0'], -1)">‹</button>
+              <span id="valScale">100%</span>
+              <button onclick="stepSetting('render_scale', ['0.667','0.75','0.85','1.0'], 1)">›</button>
+            </div>
+          </div>
+
+          <div class="set-row" onmouseenter="setHelp('Console Profile','Selects the console hardware profile reported by the runtime (Auto uses the runtime default; Series X fixes missing faces on 8 GB cards in cool_fox, Series S reduces memory use).')">
+            <span class="set-name">Console Profile</span>
+            <div class="stepper">
+              <button onclick="stepSetting('console_profile', ['auto','series-x','series-s'], -1)">‹</button>
+              <span id="valConsole">Auto</span>
+              <button onclick="stepSetting('console_profile', ['auto','series-x','series-s'], 1)">›</button>
+            </div>
+          </div>
+
+          <div class="set-row" onmouseenter="setHelp('Ray Tracing','Enables or disables ray-traced indirect lighting (VICTORY_RAYTRACING). Keep OFF for best stability and FPS on current builds.')">
+            <span class="set-name">Ray Tracing</span>
+            <label class="switch"><input id="chkRayTracing" type="checkbox" onchange="saveSetting('ray_tracing', this.checked)" /><span class="slider"></span></label>
+          </div>
+
+          <div class="set-row" onmouseenter="setHelp('Graphics / GPU Profile','Automatically filters Pillars, Components, and PortWatch VI recommendations for your GPU (NVIDIA recommended).')">
+            <span class="set-name">Graphics / GPU Profile</span>
+            <div class="stepper">
+              <button onclick="stepSetting('gpu_profile', ['NVIDIA','AMD','ALL'], -1)">‹</button>
+              <span id="valGpu">NVIDIA</span>
+              <button onclick="stepSetting('gpu_profile', ['NVIDIA','AMD','ALL'], 1)">›</button>
+            </div>
+          </div>
+
+          <div class="set-row" onmouseenter="setHelp('Prewarm Shaders','Pre-translates and caches shaders for the active runtime (cool_fox, ScarlettPort, or VIctory) before launching to cut 2–5 s in-game hitches.')">
+            <div style="min-width:0;flex:1">
+              <div class="set-name">Prewarm Shaders</div>
+              <div id="prewarmDetail" class="muted" style="font-size:.74rem">Idle — click to warm shader cache</div>
+            </div>
+            <div style="display:flex;gap:6px">
+              <button id="btnPrewarm" class="btn sm primary" onclick="togglePrewarm()">🔥 Prewarm</button>
+            </div>
+          </div>
+
+          <div class="set-section">Controls, Local Dump &amp; Storage</div>
+
+          <div class="set-row" onmouseenter="setHelp('Controls (Xbox &amp; Keyboard)','View the full Xbox controller and keyboard fallback mapping, and check whether a USB / Bluetooth gamepad is currently connected.')">
+            <div style="min-width:0;flex:1">
+              <div class="set-name">Controls (Xbox &amp; Keyboard)</div>
+              <div style="margin-top:3px"><span id="setGamepadBadge" class="badge b-upd">Checking controller...</span></div>
+            </div>
+            <button class="btn sm primary" onclick="openControlsModal()">🎮 View Controls</button>
+          </div>
+
+          <div class="set-row" onmouseenter="setHelp('Local Dump Directory','Import the folder containing your own legally dumped files (game_scarlett_master.exe + .rpf archives). This launcher does not distribute or include any game copy.')">
+            <div style="min-width:0;flex:1">
+              <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+                <span class="set-name">Local Dump Directory</span>
+                <span id="dumpStatusBadge" class="badge b-upd">Checking...</span>
+              </div>
+              <div id="valInstallDir" class="muted" style="word-break:break-all;margin-top:2px">No local dump selected</div>
+            </div>
+            <div style="display:flex;gap:6px;align-items:center">
+              <button class="btn sm primary" onclick="pickGameDir()">📂 Import Dump</button>
+              <button class="btn sm" onclick="openGameDir()">📁 Open</button>
+            </div>
+          </div>
+
+          <div class="set-row" onmouseenter="setHelp('Save Slots (Backup / Restore)','Creates or restores timestamped ZIP backups of your shared save folder (%LOCALAPPDATA%\\6ixpack\\save) before switching runtimes.')">
+            <div style="min-width:0;flex:1">
+              <div class="set-name">Save Slots (Backup)</div>
+              <div id="savesDetail" class="muted" style="font-size:.74rem">0 backups</div>
+            </div>
+            <div style="display:flex;gap:6px;flex-wrap:wrap">
+              <button class="btn sm safe" onclick="backupSaves()">💾 Backup</button>
+              <button class="btn sm" onclick="restoreSaves()">↩️ Restore</button>
+              <button class="btn sm" onclick="openSavesFolder()">📁</button>
+            </div>
+          </div>
+
+          <div class="set-row" onmouseenter="setHelp('Components Storage Drive','Drive used to store downloaded open-source runtimes, tools, and N-1 rollback backups.')">
+            <span class="set-name">Components Storage Drive</span>
+            <div style="display:flex;gap:8px;align-items:center">
+              <select id="driveSel" onchange="saveSetting('auto_download_drive', this.value)" style="background:rgba(12,8,24,.85);color:#fff;border:1px solid var(--border);border-radius:6px;padding:5px 8px;font-size:.8rem"></select>
+              <button class="btn sm" onclick="launchTool('folder')">📁 Open</button>
+            </div>
+          </div>
+
+          <div class="set-section">Diagnostics &amp; Legal</div>
+
+          <div class="set-row" onmouseenter="setHelp('Verify Environment &amp; Dump','Runs the dual-track Environment Check (PC Recomp &amp; Console Emu): verifies DirectX 12, Vulkan, compiled direct runtimes, LLVM/CMake/Rust, and your local dump directory.')">
+            <span class="set-name">Verify Environment &amp; Dump</span>
+            <button class="btn sm primary" onclick="runBootTest()">🧪 Run Check</button>
+          </div>
+
+          <div class="set-row" onmouseenter="setHelp('Game &amp; Launch Logs','Enables detailed runtime logging (RUST_LOG=info, backtraces) at launch and displays live logs below to spot errors and warnings.')">
+            <span class="set-name">Game &amp; Launch Logs</span>
+            <label class="switch"><input id="chkShowLogs" type="checkbox" onchange="saveSetting('show_logs', this.checked)" /><span class="slider"></span></label>
+          </div>
+
+          <div class="set-row" onmouseenter="setHelp('Launch in Sandboxie-Plus','Optionally runs the selected runtime inside Sandboxie-Plus (DefaultBox) to isolate it from your host system.')">
+            <span class="set-name">Launch in Sandboxie-Plus</span>
+            <label class="switch"><input id="chkSandboxie" type="checkbox" onchange="saveSetting('launch_in_sandboxie', this.checked)" /><span class="slider"></span></label>
+          </div>
+
+          <div class="set-row" onmouseenter="setHelp('Clear Launcher Cache','Clears temporary launcher discovery and thumbnail caches without touching your compiled shader cache or local dump.')">
+            <span class="set-name">Clear Launcher Cache</span>
+            <button class="btn sm" onclick="clearCache()">🧹 Clear Cache</button>
+          </div>
+
+          <div class="set-row" onmouseenter="setHelp('Legal Notice &amp; Disclaimer','Independent community project not affiliated with Rockstar Games or Take-Two Interactive. No game copies, keys, or copyrighted binaries are distributed.')">
+            <div>
+              <div class="set-name">Legal Notice &amp; Disclaimer</div>
+              <div class="muted" style="font-size:.74rem">Non-affiliated community tool · No game files included</div>
+            </div>
+            <button class="btn sm" onclick="openLegalModal()">⚖️ View Notice</button>
+          </div>
+        </div>
+
+        <div class="set-help-box">
+          <div id="helpTitle" class="set-help-title">Settings</div>
+          <div id="helpBody" class="muted" style="font-size:.84rem;line-height:1.55">
+            Hover over any setting on the left to view its description. All preferences are saved automatically.
+          </div>
+          <div style="margin-top:18px;padding-top:14px;border-top:1px solid var(--border);display:flex;flex-direction:column;gap:8px">
+            <div style="display:flex;justify-content:space-between;font-size:.82rem"><span>System Free RAM</span><b id="setRamTxt" style="color:var(--green)">—</b></div>
+            <div class="prog-track"><div id="setRamBar" class="prog-fill ok" style="width:0%"></div></div>
+            <div id="setRamWarn" class="muted" style="display:none;color:#fde68a;font-size:.74rem">⚠️ Low free RAM (&lt;5 GB) — close heavy apps before launching 3D scenes.</div>
+            <div style="display:flex;justify-content:space-between;font-size:.82rem;margin-top:6px"><span>PC Recomp Readiness</span><b id="setRecompPct" style="color:var(--cyan)">—%</b></div>
+            <div class="prog-track"><div id="setRecompBar" class="prog-fill ok" style="width:0%"></div></div>
+            <div style="display:flex;justify-content:space-between;font-size:.82rem;margin-top:4px"><span>Xbox / PS5 Emu Readiness</span><b id="setXboxPct" style="color:var(--pink-soft)">—%</b></div>
+            <div class="prog-track"><div id="setXboxBar" class="prog-fill" style="width:0%"></div></div>
+          </div>
+        </div>
+      </div>
+
+      <div id="bootResultPanel" class="panel" style="display:none">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+          <b id="bootSummary">Diagnostic...</b>
+          <button class="btn sm" onclick="document.getElementById('bootResultPanel').style.display='none'">Hide</button>
+        </div>
+        <table>
+          <thead><tr><th>Check</th><th>Track</th><th>Status</th><th>Details</th></tr></thead>
+          <tbody id="bootTbody"></tbody>
+        </table>
+      </div>
+
+      <div id="logsPanel" class="panel" style="display:none">
+        <div style="display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:8px;margin-bottom:10px">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <span style="font-weight:800">📜 Live Game &amp; Launch Logs</span>
+            <span id="gameLogState" class="badge">⚪ Idle</span>
+            <span id="gameLogErrBadge" class="badge" style="display:none;background:rgba(248,113,113,.2);color:#fca5a5;border-color:rgba(248,113,113,.45)">0 Errors</span>
+            <span id="gameLogWarnBadge" class="badge" style="display:none;background:rgba(251,191,36,.16);color:#fde68a;border-color:rgba(251,191,36,.4)">0 Warnings</span>
+          </div>
+          <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+            <div class="seg-group">
+              <button class="seg-btn active" data-logtab="game" onclick="setLogTab('game')">Game</button>
+              <button class="seg-btn" data-logtab="errors" onclick="setLogTab('errors')">Errors &amp; Warns</button>
+              <button class="seg-btn" data-logtab="launcher" onclick="setLogTab('launcher')">Launcher</button>
+            </div>
+            <button class="btn sm" onclick="openLiveConsole()">📺 Live Console</button>
+            <button class="btn sm" onclick="openGameLog()">📄 Open File</button>
+          </div>
+        </div>
+        <div id="autoLogs" class="logbox" style="max-height:240px">Waiting for game launch...</div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<!-- MODAL: VERSION COMPARISON & UPDATE -->
+<div id="whatsNewModal" class="modal-bg" onclick="if(event.target===this) closeWhatsNew()">
+  <div class="modal">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+      <h3 id="wnTitle" style="margin:0;font-size:1.03rem">⬆️ Version Comparison &amp; Update</h3>
+      <button class="btn sm" onclick="closeWhatsNew()">✕</button>
+    </div>
+    <div id="wnBody" class="muted" style="line-height:1.5;margin-bottom:16px">Loading...</div>
+    <div style="display:flex;justify-content:flex-end;gap:10px">
+      <button class="btn sm" onclick="closeWhatsNew()">Cancel</button>
+      <button class="btn sm primary" onclick="confirmWhatsNewUpdate()">⬇️ Confirm &amp; Replace (Backup N-1)</button>
+    </div>
+  </div>
+</div>
+
+<!-- MODAL: QUICK CONTROLS REFERENCE -->
+<div id="controlsModal" class="modal-bg" onclick="if(event.target===this) this.classList.remove('open')">
+  <div class="modal">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+      <h3 style="margin:0;font-size:1.05rem">🎮 Xbox &amp; Keyboard Controls</h3>
+      <button class="btn sm" onclick="document.getElementById('controlsModal').classList.remove('open')">✕</button>
+    </div>
+    <div id="gamepadStatus" class="badge b-upd" style="margin-bottom:10px">Checking controller...</div>
+    <div class="muted" style="font-size:.79rem;margin-bottom:8px">
+      Click once inside the game window to focus it. Real Xbox / PC controllers work natively; keyboard fallback keys:
+    </div>
+    <div class="ctrl-grid">
+      <div class="ctrl-item"><span>A (Confirm / Continue)</span><span class="ctrl-key">Enter</span></div>
+      <div class="ctrl-item"><span>B (Back / Cancel)</span><span class="ctrl-key">Backspace</span></div>
+      <div class="ctrl-item"><span>Left Stick (Move)</span><span class="ctrl-key">W A S D</span></div>
+      <div class="ctrl-item"><span>Right Stick (Camera)</span><span class="ctrl-key">I J K L</span></div>
+      <div class="ctrl-item"><span>D-Pad (Menus)</span><span class="ctrl-key">Arrows</span></div>
+      <div class="ctrl-item"><span>X / Y Buttons</span><span class="ctrl-key">X / Y</span></div>
+      <div class="ctrl-item"><span>LB / RB Bumpers</span><span class="ctrl-key">Q / E</span></div>
+      <div class="ctrl-item"><span>LT / RT Triggers</span><span class="ctrl-key">Z / C</span></div>
+      <div class="ctrl-item"><span>LS / RS Click</span><span class="ctrl-key">F / H</span></div>
+      <div class="ctrl-item"><span>Menu / View</span><span class="ctrl-key">Esc / Tab</span></div>
+      <div class="ctrl-item"><span>In-Game Controls Overlay</span><span class="ctrl-key">F1 / F2</span></div>
+      <div class="ctrl-item"><span>In-Game FPS Overlay</span><span class="ctrl-key">F3</span></div>
+    </div>
+  </div>
+</div>
+
+<!-- MODAL: NEWS READER -->
+<div id="newsModal" class="modal-bg" onclick="if(event.target===this) this.classList.remove('open')">
+  <div class="modal">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;gap:10px">
+      <div style="display:flex;align-items:center;gap:8px">
+        <span id="nmCat" class="badge b-pink">NEWS</span>
+        <span id="nmDate" class="muted" style="font-size:.75rem"></span>
+      </div>
+      <button class="btn sm" onclick="document.getElementById('newsModal').classList.remove('open')">✕</button>
+    </div>
+    <h3 id="nmTitle" style="margin:0 0 10px;font-size:1.08rem;line-height:1.35">News</h3>
+    <div id="nmBody" style="font-size:.87rem;line-height:1.65;color:#e2e8f0;margin-bottom:16px;white-space:pre-line"></div>
+    <div style="display:flex;justify-content:flex-end;gap:10px">
+      <button class="btn sm" onclick="document.getElementById('newsModal').classList.remove('open')">Close</button>
+      <a id="nmLink" href="https://portwatch-vi.xyz/#top" target="_blank" class="btn sm primary">Open Source ↗</a>
+    </div>
+  </div>
+</div>
+
+<!-- MODAL: LEGAL NOTICE & DISCLAIMER -->
+<div id="legalModal" class="modal-bg" onclick="if(event.target===this) this.classList.remove('open')">
+  <div class="modal">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+      <h3 style="margin:0;font-size:1.06rem">⚖️ Legal Notice &amp; Disclaimer</h3>
+      <button class="btn sm" onclick="document.getElementById('legalModal').classList.remove('open')">✕</button>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:11px;font-size:.83rem;line-height:1.58;color:#e2e8f0">
+      <div style="padding:11px 13px;border-radius:10px;background:rgba(244,63,142,.10);border:1px solid var(--border-hi)">
+        <b style="color:#fff">1. Independent Community Project — Non-Affiliation</b>
+        <div class="muted" style="margin-top:4px;color:#e2e8f0">
+          <b>SixDeck</b> is an independent, unofficial open-source desktop utility handed over to the community for compatibility research and runtime management. It is <b>not an official PortWatch VI project</b> and is <b>not affiliated with, endorsed by, sponsored by, or connected to Rockstar Games, Take-Two Interactive</b>, or any of their subsidiaries or licensors. All third-party trademarks and copyrights remain the property of their respective owners.
+        </div>
+      </div>
+      <div style="padding:11px 13px;border-radius:10px;background:rgba(255,255,255,.04);border:1px solid var(--border)">
+        <b style="color:#fff">2. No Game Copy or Copyrighted Files Provided</b>
+        <div class="muted" style="margin-top:4px;color:#cbd5e1">
+          This application does <b>not</b> include, host, distribute, or link to any copy of any commercial game, executable, decryption keys, firmware, or copyrighted assets.
+        </div>
+      </div>
+      <div style="padding:11px 13px;border-radius:10px;background:rgba(255,255,255,.04);border:1px solid var(--border)">
+        <b style="color:#fff">3. User-Supplied Local Dump Required</b>
+        <div class="muted" style="margin-top:4px;color:#cbd5e1">
+          To run a compatibility runtime, you must legally obtain and import your own local dump directory (containing <code>game_scarlett_master.exe</code> and <code>.rpf</code> archives) from media and hardware you own, using the <b>Import Dump</b> option in Settings.
+        </div>
+      </div>
+      <div style="padding:11px 13px;border-radius:10px;background:rgba(255,255,255,.04);border:1px solid var(--border)">
+        <b style="color:#fff">4. Open-Source Runtimes &amp; Third-Party Data</b>
+        <div class="muted" style="margin-top:4px;color:#cbd5e1">
+          Community runtimes, tools, and live telemetry listed via PortWatch VI and GitHub belong to their respective open-source authors and are governed by their individual licenses.
+        </div>
+      </div>
+    </div>
+    <div style="display:flex;justify-content:flex-end;margin-top:14px">
+      <button class="btn sm primary" onclick="document.getElementById('legalModal').classList.remove('open')">Understood</button>
+    </div>
+  </div>
+</div>
+
+<!-- MODAL: CRASH LOG REPORT (COPYABLE) -->
+<div id="crashModal" class="modal-bg" style="z-index:95" onclick="if(event.target===this) closeCrashModal()">
+  <div class="modal" style="max-width:740px;border-color:rgba(248,113,113,.6)">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;gap:10px">
+      <h3 style="margin:0;font-size:1.06rem;color:#fca5a5">💥 Runtime Crash Detected</h3>
+      <button class="btn sm" onclick="closeCrashModal()">✕</button>
+    </div>
+    <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:10px">
+      <span id="crashRuntime" class="badge b-miss">Runtime</span>
+      <span id="crashExitCode" class="badge b-upd">Exit Code</span>
+      <span id="crashTime" class="muted" style="font-size:.75rem"></span>
+    </div>
+    <div class="muted" style="font-size:.77rem;margin-bottom:8px">
+      Last seconds before crash (click <b>Copy Logs</b> or select text below to share a bug report):
+    </div>
+    <textarea id="crashLogText" class="crash-textarea" readonly spellcheck="false"></textarea>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-top:12px;gap:8px;flex-wrap:wrap">
+      <button class="btn sm" onclick="openGameLog()">📄 Open Full Log File</button>
+      <div style="display:flex;gap:8px">
+        <button id="btnCopyCrash" class="btn sm primary" onclick="copyCrashLogs()">📋 Copy Logs</button>
+        <button class="btn sm" onclick="closeCrashModal()">Close</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="toastWrap" class="toast-wrap"></div>
+
+<script>
+let drivesInit = false;
+let isBusy = false;
+let pendingRefresh = false;
+let currentTrack = "all";
+let currentModCat = "all";
+let lastWorkshopItems = [];
+let currentLogTab = "game";
+let lastLogData = { game: null, launcher: [] };
+let currentRunning = false;
+let gameRunning = false;
+let prewarmRunning = false;
+let hasPendingUpdates = false;
+let dumpReady = true;
+let currentSettings = {};
+let pendingUpdate = null;
+let lastSeenCrashId = 0;
+let splashHidden = false;
+const splashShownAt = Date.now();
+
+const ROLE_EN = {
+  "1. Portage / Exe PC": "1. PC Port / Native Exe",
+  "2. Émulateur / Runtime": "2. Emulator / Runtime",
+  "3. Recompilateur Statique": "3. Static Recompiler",
+  "4. Symboles / Config": "4. Symbols / Config",
+  "5. Outil RPF / RAGE 9": "5. RPF9 / RAGE 9 Tool",
+  "6. Shaders / GPU": "6. Shaders / GPU",
+  "7. Dumper / ELF-SPRX": "7. Dumper / ELF-SPRX",
+  "8. Décompilateur / IA RE": "8. Decompiler / AI RE"
+};
+const TRACK_EN = {
+  "PC Natif / Recomp": "PC Recomp",
+  "Exécution Dump / Ému": "Console Emu",
+  "Commun (RPF / Outils)": "Shared"
+};
+
+function esc(s) {
+  return String(s || "").replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function showLoader(msg) {
+  document.getElementById("loadingText").textContent = msg || "Loading...";
+  document.getElementById("loadingBanner").classList.add("show");
+}
+function hideLoader() { document.getElementById("loadingBanner").classList.remove("show"); }
+function showToast(msg, kind = "ok") {
+  const wrap = document.getElementById("toastWrap");
+  const el = document.createElement("div");
+  el.className = "toast " + kind;
+  el.textContent = msg;
+  wrap.appendChild(el);
+  setTimeout(() => { el.style.opacity = "0"; el.style.transition = "opacity .35s"; }, 3600);
+  setTimeout(() => el.remove(), 4000);
+}
+function setHelp(title, body) {
+  document.getElementById("helpTitle").textContent = title;
+  document.getElementById("helpBody").textContent = body;
+}
+function switchView(name) {
+  document.querySelectorAll(".view").forEach(v => v.classList.remove("active"));
+  document.querySelectorAll(".nav-btn").forEach(b => b.classList.toggle("active", b.dataset.view === name));
+  const target = document.getElementById("view-" + name);
+  if (target) target.classList.add("active");
+  if (name === "settings") {
+    checkSchtaskStatus();
+    updateGamepadBadges();
+  }
+}
+function setTrack(tr) {
+  currentTrack = tr;
+  document.querySelectorAll(".seg-btn").forEach(b => b.classList.toggle("active", b.dataset.track === tr));
+  refresh(true);
+}
+
+async function saveSetting(key, value) {
+  currentSettings[key] = value;
+  await fetch("/api/settings", {
+    method: "POST",
+    headers: {"Content-Type":"application/json"},
+    body: JSON.stringify({ [key]: value })
+  });
+  refresh(true);
+}
+function stepSetting(key, options, dir) {
+  const cur = String(currentSettings[key] || options[0]);
+  let idx = options.indexOf(cur);
+  if (idx < 0) idx = 0;
+  idx = (idx + dir + options.length) % options.length;
+  saveSetting(key, options[idx]);
+}
+
+async function refresh(force = false) {
+  if (isBusy) { if (force) pendingRefresh = true; return; }
+  isBusy = true;
+  try {
+    const gpu = currentSettings.gpu_profile || "NVIDIA";
+    const res = await fetch("/api/cockpit?track=" + encodeURIComponent(currentTrack) + "&gpu=" + encodeURIComponent(gpu));
+    if (!res.ok) return;
+    const d = await res.json();
+
+    currentRunning = Boolean(d.running);
+    currentSettings = d.settings || currentSettings;
+    hasPendingUpdates = Boolean(d.has_updates);
+
+    // Startup splash screen sync state
+    if (!splashHidden) {
+      const syncInfo = d.startup_sync || { done: true, stage: "Ready" };
+      const stEl = document.getElementById("splashStage");
+      if (stEl && syncInfo.stage) stEl.textContent = syncInfo.stage;
+      if (syncInfo.done) {
+        const elapsed = Date.now() - splashShownAt;
+        const waitMs = Math.max(0, 700 - elapsed);
+        setTimeout(hideSplashOverlay, waitMs);
+      }
+    }
+
+    // Auto-popup copyable crash log window on unexpected runtime crash
+    if (d.last_crash && d.last_crash.id && d.last_crash.id > lastSeenCrashId) {
+      lastSeenCrashId = d.last_crash.id;
+      openCrashModal(d.last_crash);
+    }
+
+    const dot = document.getElementById("sideStatusDot");
+    const bWatch = document.getElementById("btnWatchToggle");
+    if (d.watch_state === "running" || d.watch_state === "starting") {
+      if (dot) { dot.textContent = "🟢 Watch #" + d.cycle; dot.style.display = "inline"; }
+      if (bWatch) bWatch.textContent = "⏹ Stop Watch";
+    } else {
+      if (dot) { dot.textContent = ""; dot.style.display = "none"; }
+      if (bWatch) bWatch.textContent = "▶ Watch";
+    }
+
+    const gs = d.game_status || {};
+    const ds = d.dump_status || { ready: true, rpf_count: 0, path: "" };
+    dumpReady = Boolean(ds.ready);
+    const dumpBanner = document.getElementById("importDumpBanner");
+    if (dumpBanner) dumpBanner.style.display = dumpReady ? "none" : "flex";
+
+    gameRunning = Boolean(gs.running);
+    const playBtn = document.getElementById("btnMainPlay");
+    const linkAnyway = document.getElementById("linkPlayAnyway");
+    const livePill = document.getElementById("playLivePill");
+    if (gameRunning) {
+      playBtn.textContent = "⏹ STOP GAME";
+      playBtn.className = "btn-play stop";
+      linkAnyway.style.display = "none";
+      if (livePill) {
+        livePill.style.display = "inline-flex";
+        const fpsTxt = gs.live_fps != null ? `${gs.live_fps} FPS` : "Booting...";
+        const drawsTxt = gs.live_draws != null ? ` · ${gs.live_draws} draws/f` : "";
+        document.getElementById("playLiveFps").textContent = `🟢 ${fpsTxt}${drawsTxt} (PID ${gs.pid})`;
+        const errEl = document.getElementById("playLiveErr");
+        if (gs.error_count > 0) {
+          errEl.style.display = "inline-block";
+          errEl.textContent = `${gs.error_count} err`;
+        } else {
+          errEl.style.display = "none";
+        }
+      }
+    } else if (hasPendingUpdates) {
+      playBtn.textContent = "UPDATE";
+      playBtn.className = "btn-play update";
+      linkAnyway.style.display = "inline";
+      if (livePill) livePill.style.display = "none";
+    } else {
+      playBtn.textContent = "PLAY";
+      playBtn.className = "btn-play";
+      linkAnyway.style.display = "none";
+      if (livePill) livePill.style.display = "none";
+    }
+
+    const p1 = (d.pillars && d.pillars[0]) ? d.pillars[0] : null;
+    document.getElementById("playVersion").textContent = (p1 && p1.best && p1.best.version_label) ? p1.best.version_label : "v1.0";
+    document.getElementById("playGpuBadge").textContent = d.gpu_profile || "NVIDIA";
+
+    // Live System RAM badge on Play & Settings
+    const mem = d.system_memory || {};
+    const ramBadge = document.getElementById("playRamBadge");
+    if (ramBadge && mem.total_ram_gb) {
+      ramBadge.textContent = mem.low_memory
+        ? `⚠ ${mem.free_ram_gb} / ${mem.total_ram_gb} GB`
+        : `${mem.free_ram_gb} / ${mem.total_ram_gb} GB free`;
+      ramBadge.className = "badge " + (mem.low_memory ? "b-upd" : "b-ok");
+      ramBadge.title = `Free RAM: ${mem.free_ram_gb} GB | Free Commit: ${mem.free_commit_gb} / ${mem.total_commit_gb} GB`;
+    }
+    const setRamTxt = document.getElementById("setRamTxt");
+    const setRamBar = document.getElementById("setRamBar");
+    const setRamWarn = document.getElementById("setRamWarn");
+    if (setRamTxt && mem.total_ram_gb) {
+      setRamTxt.textContent = `${mem.free_ram_gb} GB free / ${mem.total_ram_gb} GB (Commit: ${mem.free_commit_gb} GB)`;
+      setRamTxt.style.color = mem.low_memory ? "var(--amber)" : "var(--green)";
+      if (setRamBar) {
+        const freePct = Math.max(4, Math.min(100, Math.round((mem.free_ram_gb / mem.total_ram_gb) * 100)));
+        setRamBar.style.width = freePct + "%";
+        setRamBar.className = "prog-fill " + (mem.low_memory ? "" : "ok");
+      }
+      if (setRamWarn) setRamWarn.style.display = mem.low_memory ? "block" : "none";
+    }
+
+    // Clarified Runtime dropdown (Installed & Ready vs Tracked)
+    const rtSel = document.getElementById("selRuntime");
+    const rg = d.runtime_groups || { installed: d.available_runtimes || [], tracked: [] };
+    const activeRt = currentSettings.selected_runtime || (rg.installed[0] || "cool_fox (Direct)");
+    let rtHtml = "";
+    if (rg.installed && rg.installed.length) {
+      rtHtml += `<optgroup label="Installed &amp; Ready (Direct)">` +
+        rg.installed.map(r => `<option value="${esc(r)}" ${r===activeRt?'selected':''}>✅ ${esc(r)}</option>`).join("") +
+        `</optgroup>`;
+    }
+    if (rg.tracked && rg.tracked.length) {
+      rtHtml += `<optgroup label="Tracked (Not Installed)">` +
+        rg.tracked.map(r => `<option value="${esc(r)}" ${r===activeRt?'selected':''}>📦 ${esc(r)}</option>`).join("") +
+        `</optgroup>`;
+    }
+    rtSel.innerHTML = rtHtml;
+
+    const b = d.boot_summary || {};
+    const rp = Number(b.recomp_readiness_pct || 0);
+    const xp = Number(b.xbox_readiness_pct || 0);
+    document.getElementById("setRecompPct").textContent = rp + "%";
+    document.getElementById("setXboxPct").textContent = xp + "%";
+    document.getElementById("setRecompBar").style.width = rp + "%";
+    document.getElementById("setXboxBar").style.width = xp + "%";
+
+    // News carousel
+    const pw = d.portwatch || {};
+    const cards = [];
+    if (pw.pinned && pw.pinned.text) {
+      cards.push({ flash: true, cat: "📌 FLASH", date: (pw.pinned.updated || "").slice(0,10), title: "PortWatch VI Flash", dek: pw.pinned.text });
+    }
+    (pw.news || []).forEach(n => cards.push({ flash: false, cat: (n.category || "News").toUpperCase(), date: n.date || "", title: n.title, dek: n.dek || "" }));
+    const nCnt = document.getElementById("newsCountBadge");
+    if (nCnt) nCnt.textContent = String(cards.length);
+    document.getElementById("newsStrip").innerHTML = cards.map((n, i) => `
+      <div class="news-card ${n.flash ? 'flash' : ''}" onclick="openNewsModal(${i})">
+        <div style="display:flex;flex-direction:column;gap:8px">
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:6px">
+            <span class="badge ${n.flash ? 'b-upd' : 'b-pink'}">${esc(n.cat)}</span>
+            <span class="muted" style="font-size:.71rem">${esc(n.date)}</span>
+          </div>
+          <div class="news-title">${esc(n.title)}</div>
+          <div class="news-dek">${esc(n.dek || "")}</div>
+        </div>
+        <div class="news-foot">Read article ›</div>
+      </div>`).join("") || '<div class="news-card"><div class="news-title">No news loaded yet</div><div class="news-dek">Click "Check Updates" in Settings or Components to fetch the latest community news.</div></div>';
+    window._newsCards = cards;
+
+    // ==================== ONLINE TWEETS & VIDEO ARTICLES ====================
+    const onAll = d.online_news || [];
+    const onTweets = onAll.filter(x => x.kind === "tweet");
+    const onArticles = onAll.filter(x => x.kind !== "tweet");
+    window._onlineArticles = onArticles;
+    const twCnt = document.getElementById("onlineTweetCount");
+    if (twCnt) twCnt.textContent = String(onTweets.length);
+    const twGrid = document.getElementById("onlineTweetsGrid");
+    if (twGrid) {
+      twGrid.innerHTML = onTweets.map(t => {
+        const init = (t.handle || "@X").replace("@", "").slice(0, 2).toUpperCase();
+        return `<div class="tweet-card">
+          <div class="tweet-head">
+            <div style="display:flex;align-items:center;gap:9px">
+              <div class="tweet-avatar">${esc(init)}</div>
+              <div>
+                <div style="font-weight:800;font-size:.86rem;color:#fff">${esc(t.handle || '@Community')}</div>
+                <div class="muted" style="font-size:.71rem">${esc(t.source || 'X / Twitter')} · ${esc(t.date || '')}</div>
+              </div>
+            </div>
+            <span class="badge b-upd">${esc(t.category || 'X VIDEO')}</span>
+          </div>
+          <div style="font-size:.83rem;line-height:1.48;color:#e2e8f0">${esc(t.dek || t.title)}</div>
+          <a class="video-preview-box" href="${esc(t.url)}" target="_blank">
+            <div class="video-play-circle"><svg viewBox="0 0 24 24" width="16" height="16" fill="#fff"><polygon points="7,4 20,12 7,20"/></svg></div>
+            <div style="min-width:0;flex:1">
+              <div style="font-weight:800;font-size:.81rem;color:#fff">${esc(t.video_label || 'Watch Video on X')}</div>
+              <div class="muted" style="font-size:.71rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(t.url)}</div>
+            </div>
+            <span style="font-size:.8rem;font-weight:800;color:var(--pink-soft)">↗</span>
+          </a>
+        </div>`;
+      }).join("") || '<div class="muted">No tweets loaded yet — click Refresh.</div>';
+    }
+
+    const onCnt = document.getElementById("onlineNewsCount");
+    if (onCnt) onCnt.textContent = String(onArticles.length);
+    const onGrid = document.getElementById("onlineNewsGrid");
+    if (onGrid) {
+      onGrid.innerHTML = onArticles.map((n, i) => {
+        const srcHtml = (n.sources && n.sources.length)
+          ? `<div class="src-pills" onclick="event.stopPropagation()">` +
+            n.sources.slice(0, 2).map(s => `<a class="src-pill" href="${esc(s.url)}" target="_blank">${esc(s.outlet || 'Source')} ↗</a>`).join("") +
+            `</div>`
+          : "";
+        return `<div class="online-card ${n.highlight ? 'hl' : ''}" onclick="openOnlineNewsModal(${i})">
+          <div style="display:flex;flex-direction:column;gap:7px">
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:6px;flex-wrap:wrap">
+              <div style="display:flex;gap:6px;align-items:center">
+                <span class="badge ${n.has_video ? 'b-upd' : 'b-pink'}">${n.has_video ? '🎬 ' : ''}${esc(n.category || 'ARTICLE')}</span>
+                <span class="muted" style="font-size:.71rem">${esc(n.source || '')}</span>
+              </div>
+              <span class="muted" style="font-size:.71rem">${esc(n.date || '')}</span>
+            </div>
+            <div class="news-title">${esc(n.title)}</div>
+            <div class="news-dek">${esc(n.dek || '')}</div>
+          </div>
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding-top:6px;border-top:1px solid rgba(255,255,255,.06)">
+            ${srcHtml || '<span></span>'}
+            <span style="font-size:.73rem;font-weight:700;color:var(--pink-soft);white-space:nowrap">Read full ›</span>
+          </div>
+        </div>`;
+      }).join("") || '<div class="muted" style="padding:12px">Click Refresh to fetch the latest articles.</div>';
+    }
+
+    // ==================== MODS (with real source preview images via local proxy) ====================
+    function imgSrc(u) {
+      if (!u) return "/assets/bg.png";
+      if (u.startsWith("http://") || u.startsWith("https://")) return "/api/proxy-image?url=" + encodeURIComponent(u);
+      return u;
+    }
+    const mods = d.mods || { installed: [], workshop: [] };
+    document.getElementById("chkVanilla").checked = Boolean(currentSettings.vanilla_mode);
+    document.getElementById("modsInstalledCount").textContent = (mods.installed || []).length;
+    document.getElementById("modsInstalledList").innerHTML = (mods.installed || []).map(m => {
+      const thumbSrc = imgSrc(m.image);
+      return `<div class="mod-row">
+        <div style="display:flex;gap:4px">
+          <button class="btn sm" onclick="modsAction('move','${esc(m.id)}','up')">↑</button>
+          <button class="btn sm" onclick="modsAction('move','${esc(m.id)}','down')">↓</button>
+        </div>
+        <img class="mod-thumb" src="${esc(thumbSrc)}" alt="${esc(m.name)}" onerror="this.src='/assets/bg.png'" />
+        <div><b>${esc(m.name)}</b><div class="muted" style="font-size:.73rem">${esc(m.category || '')}</div></div>
+        <div><span class="badge ${m.risk==='code' ? 'b-upd' : 'b-ok'}">${m.risk==='code' ? 'Code / DLL' : 'Assets'}</span></div>
+        <div class="muted">${esc(m.version || 'local')}</div>
+        <label class="switch"><input type="checkbox" ${m.enabled ? 'checked' : ''} onchange="modsAction('toggle','${esc(m.id)}',this.checked)" /><span class="slider green"></span></label>
+      </div>`;
+    }).join("") || '<div class="muted" style="padding:12px 4px">No mods installed yet — install from Workshop below or drop a mod folder into your Mods directory.</div>';
+
+    lastWorkshopItems = mods.workshop || [];
+    renderWorkshop();
+
+    // ==================== COMPONENTS ====================
+    const trNames = { all: "All Tracks", recomp: "PC Recomp", xbox: "Xbox Emu", ps5: "PS5 Emu" };
+    document.getElementById("compConfigLine").textContent = `Config: ${d.gpu_profile || 'NVIDIA'} · ${trNames[currentTrack] || 'All'} · Drive ${d.auto_download_drive || 'D'}:`;
+    document.getElementById("compList").innerHTML = (d.roles_table || []).map(r => {
+      const roleDisp = ROLE_EN[r.role] || r.role;
+      const trackDisp = TRACK_EN[r.track] || r.track;
+      const curTitle = r.current ? r.current.title : "";
+      const curVer = r.current ? (r.current.installed_version || "") : "";
+      const curDate = r.current ? (r.current.downloaded_at || "") : "";
+      const pct = r.best ? Math.min(100, Math.round(r.best.pw_score > 0 ? r.best.pw_score : r.best.score)) : 0;
+      const gpus = (r.best && r.best.gpu && r.best.gpu.length)
+        ? r.best.gpu.map(g => `<span class="badge ${g==='NVIDIA'?'b-ok':'b-upd'}">${esc(g)}</span>`).join(" ")
+        : "";
+      const callArgs = r.best
+        ? `'${esc(r.best.url)}','${esc(r.best.download_url)}','${esc(r.role)}','${esc(r.best.id)}','${esc(r.best.title)}','${esc(curTitle)}','${esc(curVer)}','${esc(curDate)}'`
+        : "";
+      const actBtn = r.best
+        ? (r.missing
+            ? `<button class="btn sm safe" onclick="openWhatsNew(${callArgs})">⬇️ Install</button>`
+            : (r.update_suggested
+                ? `<button class="btn sm primary" onclick="openWhatsNew(${callArgs})">⬆️ Diff &amp; Update</button>`
+                : `<span class="badge b-ok">✅ Up to date</span> <button class="btn sm" onclick="openWhatsNew(${callArgs})">🔍</button>`))
+        : '<span class="muted">—</span>';
+      const rbBtn = r.has_backup ? `<button class="btn sm" title="Rollback to N-1 version" onclick="rollbackRole('${esc(r.role)}')">↩️</button>` : "";
+      return `<div class="dl-item">
+        <div>
+          <b>${esc(roleDisp)}</b>
+          <div class="muted" style="font-size:.73rem">${esc(trackDisp)} ${r.current ? '· Local: ' + esc(curVer) : '· Missing'}</div>
+        </div>
+        <div>
+          ${r.best ? `<a href="${esc(r.best.url)}" target="_blank"><b>${esc(r.best.title)}</b></a> ${gpus}` : '<span class="muted">No candidate yet</span>'}
+          <div class="prog-track"><div class="prog-fill ${!r.missing && !r.update_suggested ? 'ok' : ''}" style="width:${pct}%"></div></div>
+        </div>
+        <div class="muted">${r.best ? esc(r.best.version_label || '') + '<br/>' + esc(r.best.status) : '—'}</div>
+        <div style="display:flex;gap:6px;justify-content:flex-end;align-items:center">${actBtn}${rbBtn}</div>
+      </div>`;
+    }).join("");
+
+    // PortWatch VI Leaderboard
+    const board = pw.leaderboard || [];
+    document.getElementById("pwCount").textContent = board.length;
+    document.getElementById("pwBoardTbody").innerHTML = board.slice(0, 15).map((e, idx) => {
+      const gpus = (e.gpu && e.gpu.length) ? e.gpu.map(g => `<span class="badge ${g==='NVIDIA'?'b-ok':'b-upd'}">${esc(g)}</span>`).join(" ") : '<span class="muted">—</span>';
+      const act = e.repo ? `<button class="btn sm primary" onclick="openWhatsNew('${esc(e.url)}','${esc(e.url)}','2. Émulateur / Runtime','','${esc(e.name)}')">🔍 / ⬇️</button>` : '<span class="badge">🔒 Private</span>';
+      return `<tr>
+        <td><b>#${idx+1}</b></td>
+        <td>${e.repo ? `<a href="${esc(e.url)}" target="_blank"><b>${esc(e.name)}</b></a>` : `<b>${esc(e.name)}</b>`}</td>
+        <td>${gpus}</td>
+        <td><b style="color:var(--pink-soft)">${e.score_pct}%</b></td>
+        <td>${e.fps ? e.fps + ' FPS' : '—'}${e.render_pct ? ' · ' + e.render_pct + '%' : ''}</td>
+        <td>${esc(e.status)}</td>
+        <td>${act}</td>
+      </tr>`;
+    }).join("");
+
+    // ==================== SETTINGS ====================
+    const fpsDisp = currentSettings.fps_limit === "Illimité" ? "Unlimited" : (currentSettings.fps_limit || "60");
+    document.getElementById("valFps").textContent = fpsDisp;
+    const valRes = document.getElementById("valRes");
+    if (valRes) valRes.textContent = currentSettings.resolution || "1920x1080";
+    const valScale = document.getElementById("valScale");
+    if (valScale) {
+      const sc = parseFloat(currentSettings.render_scale || "1.0");
+      valScale.textContent = Math.round(sc * 100) + "%";
+    }
+    const valCon = document.getElementById("valConsole");
+    if (valCon) {
+      const cp = String(currentSettings.console_profile || "auto");
+      valCon.textContent = cp === "series-x" ? "Series X" : (cp === "series-s" ? "Series S" : "Auto");
+    }
+    const chkRt = document.getElementById("chkRayTracing");
+    if (chkRt) chkRt.checked = Boolean(currentSettings.ray_tracing);
+
+    // Prewarm status
+    const pwSt = d.prewarm || { state: "idle", detail: "" };
+    prewarmRunning = pwSt.state === "running";
+    const pwDet = document.getElementById("prewarmDetail");
+    const btnPw = document.getElementById("btnPrewarm");
+    if (pwDet) {
+      pwDet.textContent = pwSt.detail || (prewarmRunning ? "Prewarming shaders..." : "Idle — click to warm shader cache");
+    }
+    if (btnPw) {
+      btnPw.textContent = prewarmRunning ? "⏹ Cancel" : "🔥 Prewarm";
+      btnPw.className = "btn sm " + (prewarmRunning ? "" : "primary");
+    }
+
+    // Save slots backup info
+    const sv = d.saves_info || {};
+    const svEl = document.getElementById("savesDetail");
+    if (svEl) {
+      svEl.textContent = sv.backup_count
+        ? `${sv.backup_count} backup(s) · latest: ${sv.latest_backup}`
+        : "No backups yet";
+    }
+
+    document.getElementById("valGpu").textContent = d.gpu_profile || "NVIDIA";
+    document.getElementById("valInstallDir").textContent = currentSettings.install_dir || "No local dump selected";
+    const dumpBadge = document.getElementById("dumpStatusBadge");
+    if (dumpBadge) {
+      if (ds.ready) {
+        dumpBadge.className = "badge b-ok";
+        dumpBadge.textContent = ds.rpf_count > 0 ? `✅ Ready (${ds.rpf_count} .rpf)` : "✅ Ready";
+      } else {
+        dumpBadge.className = "badge b-miss";
+        dumpBadge.textContent = "⚠️ Missing Dump";
+      }
+    }
+    const chkUpdStart = document.getElementById("chkUpdatesStartup");
+    if (chkUpdStart) chkUpdStart.checked = currentSettings.check_updates_on_startup !== false;
+    const updDet = document.getElementById("updCheckDetail");
+    if (updDet) {
+      if (d.updates_checked) {
+        const cnt = Number(d.pending_updates_count || 0);
+        updDet.textContent = cnt > 0
+          ? `Last check: ${d.last_update_check || "just now"} · ${cnt} update(s) available`
+          : `Last check: ${d.last_update_check || "just now"} · All critical components up to date`;
+      } else {
+        updDet.textContent = currentSettings.check_updates_on_startup === false
+          ? "Disabled on startup — PLAY stays default"
+          : "Not checked yet — PLAY stays default";
+      }
+    }
+    updateGamepadBadges();
+    document.getElementById("chkShowLogs").checked = Boolean(currentSettings.show_logs);
+    document.getElementById("chkSandboxie").checked = Boolean(currentSettings.launch_in_sandboxie);
+    document.getElementById("chkAutoDl").checked = Boolean(d.auto_download_enabled);
+    document.getElementById("logsPanel").style.display = currentSettings.show_logs ? "block" : "none";
+    lastLogData = { game: d.game_logs || null, launcher: d.auto_logs || [] };
+    renderLogsPanel();
+
+    if (!drivesInit && d.drives && d.drives.length) {
+      drivesInit = true;
+      document.getElementById("driveSel").innerHTML = d.drives.map(dr =>
+        `<option value="${esc(dr.letter)}" ${dr.letter===d.auto_download_drive?'selected':''}>${esc(dr.letter)}: (${dr.free_gb} GB free)</option>`
+      ).join("");
+    }
+  } catch (e) {} finally {
+    isBusy = false;
+    if (pendingRefresh) { pendingRefresh = false; refresh(false); }
+  }
+}
+
+function setModCat(cat) {
+  currentModCat = cat;
+  document.querySelectorAll("[data-modcat]").forEach(b => b.classList.toggle("active", b.dataset.modcat === cat));
+  renderWorkshop();
+}
+
+function renderWorkshop() {
+  const grid = document.getElementById("workshopGrid");
+  if (!grid) return;
+  const q = ((document.getElementById("modSearch") || {}).value || "").trim().toLowerCase();
+  const filtered = (lastWorkshopItems || []).filter(w => {
+    if (currentModCat !== "all" && w.category !== currentModCat) return false;
+    if (q && !`${w.name} ${w.desc} ${w.category} ${w.author || ""}`.toLowerCase().includes(q)) return false;
+    return true;
+  });
+  const cntEl = document.getElementById("wsCount");
+  if (cntEl) cntEl.textContent = String(filtered.length);
+  const proxyImg = (u) => (!u ? "/assets/bg.png" : (u.startsWith("http") ? "/api/proxy-image?url=" + encodeURIComponent(u) : u));
+  grid.innerHTML = filtered.map(w => `
+    <div class="ws-card">
+      <div class="ws-img-wrap" style="background:${w.accent || 'linear-gradient(135deg,#2a1847,#11162a)'}">
+        <img src="${esc(proxyImg(w.image))}" alt="${esc(w.name)}" onerror="this.src='/assets/bg.png'" />
+      </div>
+      <div class="ws-body">
+        <div>
+          <span class="badge b-pink">${esc(w.category)}</span>
+          <div style="font-weight:800;font-size:.9rem;margin-top:6px">${esc(w.name)}</div>
+          <div class="muted" style="font-size:.74rem;margin-top:4px">${esc(w.desc)}</div>
+        </div>
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <a href="${esc(w.url)}" target="_blank" style="font-size:.74rem">GitHub ↗</a>
+          ${w.installed ? '<span class="badge b-ok">✅ Installed</span>' : `<button class="btn sm primary" onclick="installWorkshop('${esc(w.id)}','${esc(w.name)}')">⬇️ Install</button>`}
+        </div>
+      </div>
+    </div>`).join("") || '<div class="muted" style="padding:10px">No matching mod sources for this filter.</div>';
+}
+
+function openNewsModal(idx) {
+  const n = (window._newsCards || [])[idx];
+  if (!n) return;
+  const catEl = document.getElementById("nmCat");
+  if (catEl) {
+    catEl.textContent = n.cat || "NEWS";
+    catEl.className = "badge " + (n.flash ? "b-upd" : "b-pink");
+  }
+  const dtEl = document.getElementById("nmDate");
+  if (dtEl) dtEl.textContent = n.date || "";
+  document.getElementById("nmTitle").textContent = n.title;
+  document.getElementById("nmBody").textContent = n.dek || "";
+  const lnk = document.getElementById("nmLink");
+  if (lnk) {
+    lnk.href = n.url || "https://portwatch-vi.xyz/#top";
+    lnk.textContent = "Open Source ↗";
+  }
+  document.getElementById("newsModal").classList.add("open");
+}
+
+function openOnlineNewsModal(idx) {
+  const n = (window._onlineArticles || [])[idx];
+  if (!n) return;
+  const catEl = document.getElementById("nmCat");
+  if (catEl) {
+    catEl.textContent = (n.has_video ? "🎬 " : "") + (n.category || "ONLINE");
+    catEl.className = "badge " + (n.has_video || n.highlight ? "b-upd" : "b-pink");
+  }
+  const dtEl = document.getElementById("nmDate");
+  if (dtEl) dtEl.textContent = [n.source, n.date].filter(Boolean).join(" · ");
+  document.getElementById("nmTitle").textContent = n.title;
+  document.getElementById("nmBody").textContent = n.body || n.dek || "";
+  const lnk = document.getElementById("nmLink");
+  if (lnk) {
+    lnk.href = n.url || "https://portwatch-vi.xyz/#top";
+    lnk.textContent = n.has_video ? "▶ Watch Video / Source ↗" : "Open Source ↗";
+  }
+  document.getElementById("newsModal").classList.add("open");
+}
+
+async function syncOnlineNews() {
+  showLoader("Fetching latest online & multiplayer modding news...");
+  try {
+    const res = await fetch("/api/sync-online-news", { method: "POST" });
+    const r = await res.json();
+    showToast(r.ok ? `🌐 Online news updated (${r.count} items)` : "❌ Failed to refresh online news", r.ok ? "ok" : "err");
+  } finally { hideLoader(); refresh(true); }
+}
+
+function scrollNews(dir) {
+  const strip = document.getElementById("newsStrip");
+  if (strip) strip.scrollBy({ left: dir * 294, behavior: "smooth" });
+}
+
+function hideSplashOverlay() {
+  if (splashHidden) return;
+  splashHidden = true;
+  const ov = document.getElementById("splashOverlay");
+  if (ov) {
+    ov.classList.add("hidden");
+    setTimeout(() => { ov.style.display = "none"; }, 520);
+  }
+}
+
+function openCrashModal(crash) {
+  if (!crash) return;
+  document.getElementById("crashRuntime").textContent = crash.runtime || "Runtime";
+  document.getElementById("crashExitCode").textContent = "Exit: " + (crash.exit_hex || crash.exit_code || "error");
+  document.getElementById("crashTime").textContent = crash.timestamp || "";
+  const ta = document.getElementById("crashLogText");
+  if (ta) {
+    ta.value = crash.excerpt || "(No logs captured)";
+    setTimeout(() => { ta.scrollTop = ta.scrollHeight; }, 30);
+  }
+  const btn = document.getElementById("btnCopyCrash");
+  if (btn) btn.textContent = "📋 Copy Logs";
+  document.getElementById("crashModal").classList.add("open");
+}
+
+function closeCrashModal() {
+  document.getElementById("crashModal").classList.remove("open");
+  fetch("/api/dismiss-crash", { method: "POST" }).catch(() => {});
+}
+
+async function copyCrashLogs() {
+  const ta = document.getElementById("crashLogText");
+  if (!ta) return;
+  const text = ta.value || "";
+  let copied = false;
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text);
+      copied = true;
+    }
+  } catch (e) {}
+  if (!copied) {
+    ta.focus();
+    ta.select();
+    try { copied = document.execCommand("copy"); } catch (e) {}
+  }
+  const btn = document.getElementById("btnCopyCrash");
+  if (btn) {
+    btn.textContent = copied ? "✅ Copied!" : "📋 Select & Ctrl+C";
+    setTimeout(() => { btn.textContent = "📋 Copy Logs"; }, 2200);
+  }
+  showToast(copied ? "📋 Crash logs copied to clipboard!" : "Select the text box and press Ctrl+C", "ok");
+}
+
+function openLegalModal() {
+  document.getElementById("legalModal").classList.add("open");
+}
+
+async function onMainPlayClick() {
+  if (gameRunning) { await stopGameNow(); }
+  else if (hasPendingUpdates) { await updateAllPillars(); }
+  else if (!dumpReady) {
+    showToast("📂 Select your own local dump folder first.", "err");
+    await pickGameDir();
+  }
+  else { await playNow(); }
+}
+
+async function stopGameNow() {
+  showLoader("Stopping running runtime...");
+  try {
+    const res = await fetch("/api/stop-game", { method: "POST" });
+    const r = await res.json();
+    showToast(r.ok ? ("⏹ " + (r.message || "Stopped")) : ("❌ " + (r.error || "Failed")), r.ok ? "ok" : "err");
+  } finally { hideLoader(); refresh(true); }
+}
+
+function updateGamepadBadges() {
+  const pads = (navigator.getGamepads ? Array.from(navigator.getGamepads()).filter(Boolean) : []);
+  const connected = pads.length > 0;
+  const txt = connected
+    ? "🟢 Controller: " + (pads[0].id || "Gamepad").slice(0, 44)
+    : "⚪ No controller — Keyboard & Mouse";
+  const cls = "badge " + (connected ? "b-ok" : "b-upd");
+  ["gamepadStatus", "setGamepadBadge"].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) {
+      el.className = cls;
+      el.textContent = txt;
+    }
+  });
+}
+
+function openControlsModal() {
+  updateGamepadBadges();
+  document.getElementById("controlsModal").classList.add("open");
+}
+
+async function togglePrewarm() {
+  const url = prewarmRunning ? "/api/stop-prewarm" : "/api/prewarm-shaders";
+  const res = await fetch(url, { method: "POST" });
+  const r = await res.json();
+  showToast(r.ok ? ("🔥 " + (r.message || "OK")) : ("❌ " + (r.error || "Failed")), r.ok ? "ok" : "err");
+  refresh(true);
+}
+
+async function backupSaves() {
+  showLoader("Backing up save slots...");
+  try {
+    const res = await fetch("/api/saves/backup", { method: "POST" });
+    const r = await res.json();
+    showToast(r.ok ? ("💾 " + r.message) : ("❌ " + (r.error || "Failed")), r.ok ? "ok" : "err");
+  } finally { hideLoader(); refresh(true); }
+}
+
+async function restoreSaves() {
+  showLoader("Restoring latest save backup...");
+  try {
+    const res = await fetch("/api/saves/restore", { method: "POST", headers: {"Content-Type":"application/json"}, body: JSON.stringify({}) });
+    const r = await res.json();
+    showToast(r.ok ? ("↩️ " + r.message) : ("❌ " + (r.error || "Failed")), r.ok ? "ok" : "err");
+  } finally { hideLoader(); refresh(true); }
+}
+
+async function openSavesFolder() {
+  await fetch("/api/saves/open", { method: "POST" });
+}
+
+async function playNow() {
+  showLoader("Launching runtime " + (currentSettings.selected_runtime || "Direct Runtime") + "...");
+  try {
+    const res = await fetch("/api/play", { method: "POST" });
+    const r = await res.json();
+    showToast(r.ok ? ("▶ " + (r.message || "Launched!")) : ("❌ " + (r.error || "Failed")), r.ok ? "ok" : "err");
+  } finally { hideLoader(); refresh(true); }
+}
+
+async function updateAllPillars() {
+  showLoader("Updating critical Pillars (" + (currentSettings.gpu_profile || "NVIDIA") + ") + N-1 Backup...");
+  try {
+    const res = await fetch("/api/update-all", { method: "POST" });
+    const r = await res.json();
+    showToast(r.ok ? ("✅ " + r.message) : ("❌ " + (r.error || "Failed")), r.ok ? "ok" : "err");
+  } finally { hideLoader(); refresh(true); }
+}
+
+async function rollbackRole(role) {
+  showLoader("Restoring previous (N-1) version for " + (ROLE_EN[role] || role) + "...");
+  try {
+    const drive = currentSettings.auto_download_drive || "D";
+    const res = await fetch("/api/rollback-role", {
+      method: "POST", headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({ role, drive })
+    });
+    const r = await res.json();
+    showToast(r.ok ? ("↩️ " + r.message) : ("❌ " + (r.error || "Failed")), r.ok ? "ok" : "err");
+  } finally { hideLoader(); refresh(true); }
+}
+
+async function openWhatsNew(repoUrl, dlUrl, role, itemId, title, currentTitle = "", currentVersion = "", currentDate = "") {
+  pendingUpdate = { dlUrl, role, itemId, title };
+  document.getElementById("wnTitle").textContent = "⬆️ Version Comparison & Update — " + title;
+  document.getElementById("wnBody").innerHTML = `<div style="display:flex;align-items:center;gap:10px;padding:12px 0"><span class="spinner"></span><span>Comparing installed version vs new version...</span></div>`;
+  document.getElementById("whatsNewModal").classList.add("open");
+  try {
+    const qs = new URLSearchParams({ url: repoUrl||"", item_id: itemId||"", role: role||"", current_title: currentTitle||"", current_version: currentVersion||"", current_date: currentDate||"" });
+    const res = await fetch("/api/whats-new?" + qs.toString());
+    const r = await res.json();
+    let html = `
+      <div style="display:grid;grid-template-columns:1fr auto 1fr;gap:10px;align-items:center;background:rgba(255,255,255,.05);border:1px solid var(--border);border-radius:12px;padding:12px;margin-bottom:14px">
+        <div>
+          <div class="muted" style="font-size:.7rem;text-transform:uppercase">Current Version</div>
+          <div style="font-weight:800;color:#e2e8f0;margin-top:2px">${esc(r.current_version || "Not installed")}</div>
+          ${r.current_title ? `<div class="muted" style="font-size:.72rem">${esc(r.current_title)}</div>` : ""}
+        </div>
+        <div style="font-size:1.3rem;color:var(--pink-soft);font-weight:900">➜</div>
+        <div>
+          <div class="muted" style="font-size:.7rem;text-transform:uppercase">New Version (Update)</div>
+          <div style="font-weight:800;color:var(--green);margin-top:2px">${esc(r.new_version || "Latest")}</div>
+          <div class="muted" style="font-size:.72rem">${esc(r.repo || title)}</div>
+        </div>
+      </div>`;
+    if (r.differences && r.differences.length) {
+      html += `<div style="margin-bottom:14px;background:rgba(244,63,142,.10);border:1px solid var(--border-hi);border-radius:12px;padding:12px">
+        <div style="font-weight:800;color:#fff;margin-bottom:6px">📋 Differences Between Versions</div>
+        <ul style="margin:0;padding-left:18px;color:#f3f4f6;font-size:.82rem;line-height:1.5">${r.differences.map(df => `<li>${esc(df)}</li>`).join("")}</ul>
+      </div>`;
+    }
+    if (r.commits && r.commits.length) {
+      html += `<div style="font-weight:700;color:#e2e8f0;margin-bottom:6px">Latest GitHub Commits</div>`;
+      html += r.commits.slice(0,4).map(c => `<div class="commit-row"><b style="color:#fff">${esc(c.message)}</b><div class="muted">${esc(c.sha)} · ${esc(c.author)} · ${esc(c.date)}</div></div>`).join("");
+    }
+    document.getElementById("wnBody").innerHTML = html;
+  } catch (e) {
+    document.getElementById("wnBody").textContent = "Preview unavailable (you can still proceed with the update).";
+  }
+}
+function closeWhatsNew() { document.getElementById("whatsNewModal").classList.remove("open"); pendingUpdate = null; }
+async function confirmWhatsNewUpdate() {
+  if (!pendingUpdate) return;
+  const { dlUrl, role, itemId, title } = pendingUpdate;
+  closeWhatsNew();
+  const drive = currentSettings.auto_download_drive || "D";
+  showLoader(`Downloading & Defender scanning [${ROLE_EN[role] || role}] (${title})...`);
+  try {
+    const res = await fetch("/api/download-role", {
+      method: "POST", headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({ url: dlUrl, role, drive, item_id: itemId, replace_old: true })
+    });
+    const r = await res.json();
+    showToast(r.ok ? `✅ Updated (N-1 backup saved)` : `❌ ${r.error || 'Failed'}`, r.ok ? "ok" : "err");
+  } finally { hideLoader(); refresh(true); }
+}
+
+async function modsAction(action, modId = "", value = "") {
+  await fetch("/api/mods/" + action, {
+    method: "POST", headers: {"Content-Type":"application/json"},
+    body: JSON.stringify({ id: modId, value })
+  });
+  refresh(true);
+}
+async function installWorkshop(id, name) {
+  showLoader(`Downloading & Defender scanning ${name}...`);
+  try {
+    const res = await fetch("/api/mods/install-workshop", {
+      method: "POST", headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({ id })
+    });
+    const r = await res.json();
+    showToast(r.ok ? ("✅ " + r.message) : ("❌ " + (r.error || "Failed")), r.ok ? "ok" : "err");
+  } finally { hideLoader(); refresh(true); }
+}
+
+async function toggleWatch() {
+  try {
+    showLoader(currentRunning ? "Stopping watch..." : "Starting live watch...");
+    await fetch(currentRunning ? "/api/stop" : "/api/start", {
+      method: "POST", headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({ sources: ["all"] })
+    });
+    showToast(currentRunning ? "Watch stopped." : "Watch started!", "ok");
+  } finally { hideLoader(); refresh(true); }
+}
+async function checkUpdatesNow() {
+  showLoader("Checking PortWatch VI for component updates...");
+  try {
+    const res = await fetch("/api/check-updates", { method: "POST" });
+    const r = await res.json();
+    if (!r.ok) {
+      showToast("❌ Update check failed: " + (r.error || "error"), "err");
+    } else if (r.has_updates) {
+      showToast(`⬆️ ${r.pending_count} update(s) available — Play button switched to UPDATE.`, "ok");
+    } else {
+      showToast(`✅ Everything is up to date (${r.builds} builds checked).`, "ok");
+    }
+  } finally { hideLoader(); refresh(true); }
+}
+async function syncPortWatch() {
+  showLoader("Syncing with PortWatch VI...");
+  try {
+    const res = await fetch("/api/sync-portwatch", { method: "POST" });
+    const r = await res.json();
+    showToast(r.ok ? `🏆 PortWatch VI synced (${r.builds} builds, ${r.tools} tools)` : "❌ Sync failed", r.ok ? "ok" : "err");
+  } finally { hideLoader(); refresh(true); }
+}
+async function clearCache() {
+  showLoader("Clearing launcher cache...");
+  try {
+    const res = await fetch("/api/clear-cache", { method: "POST" });
+    const r = await res.json();
+    showToast("🧹 " + (r.message || "Cache cleared"), "ok");
+  } finally { hideLoader(); refresh(true); }
+}
+async function pickGameDir() {
+  showLoader("Selecting local dump directory...");
+  try {
+    const res = await fetch("/api/pick-game-dir", { method: "POST" });
+    const r = await res.json();
+    if (r.ok && r.install_dir) {
+      const ds = r.dump_status || {};
+      if (ds.ready) {
+        showToast(`✅ Local dump imported (${ds.rpf_count || 0} .rpf): ${r.install_dir}`, "ok");
+      } else {
+        showToast("⚠️ Folder selected, but game_scarlett_master.exe was not found inside.", "err");
+      }
+      refresh(true);
+    }
+  } finally { hideLoader(); }
+}
+async function openGameDir() {
+  const res = await fetch("/api/open-game-dir", { method: "POST" });
+  const r = await res.json();
+  if (!r.ok) showToast("❌ " + (r.error || "Folder not found"), "err");
+}
+function setLogTab(tab) {
+  currentLogTab = tab;
+  document.querySelectorAll("[data-logtab]").forEach(b => b.classList.toggle("active", b.dataset.logtab === tab));
+  renderLogsPanel();
+}
+function renderLogsPanel() {
+  const box = document.getElementById("autoLogs");
+  if (!box) return;
+  const g = lastLogData.game;
+  const st = document.getElementById("gameLogState");
+  const eb = document.getElementById("gameLogErrBadge");
+  const wb = document.getElementById("gameLogWarnBadge");
+  if (g) {
+    if (st) st.textContent = g.running ? `🟢 Running (PID ${g.pid})` : (g.lines && g.lines.length ? "⚪ Last Session" : "⚪ Idle");
+    if (eb) { eb.style.display = g.error_count > 0 ? "inline-flex" : "none"; eb.textContent = `${g.error_count} Error${g.error_count > 1 ? 's' : ''}`; }
+    if (wb) { wb.style.display = g.warn_count > 0 ? "inline-flex" : "none"; wb.textContent = `${g.warn_count} Warn${g.warn_count > 1 ? 's' : ''}`; }
+  }
+  let lines = [];
+  if (currentLogTab === "launcher") {
+    lines = lastLogData.launcher || [];
+  } else if (currentLogTab === "errors") {
+    lines = (g && g.errors_tail) ? g.errors_tail : [];
+  } else {
+    lines = (g && g.lines) ? g.lines : [];
+  }
+  if (!lines.length) {
+    box.textContent = currentLogTab === "errors" ? "No errors or warnings detected in the game log." : "Waiting for game launch logs...";
+    return;
+  }
+  const atBottom = (box.scrollHeight - box.scrollTop - box.clientHeight) < 40;
+  box.innerHTML = lines.map(ln => {
+    const s = esc(ln);
+    if (/\b(ERROR|FATAL)\b|panic|panicked|crashed|os error/i.test(ln)) return `<div style="color:#fca5a5">${s}</div>`;
+    if (/\bWARN\b/i.test(ln)) return `<div style="color:#fde68a">${s}</div>`;
+    return `<div>${s}</div>`;
+  }).join("");
+  if (atBottom) box.scrollTop = box.scrollHeight;
+}
+async function openGameLog() {
+  const res = await fetch("/api/open-game-log", { method: "POST" });
+  const r = await res.json();
+  if (!r.ok) showToast("❌ " + (r.error || "No log file yet"), "err");
+}
+async function openLiveConsole() {
+  const res = await fetch("/api/open-live-console", { method: "POST" });
+  const r = await res.json();
+  showToast(r.ok ? "📺 Live game log console opened" : ("❌ " + (r.error || "Failed")), r.ok ? "ok" : "err");
+}
+async function runBootTest() {
+  const drive = currentSettings.auto_download_drive || "D";
+  showLoader("Verifying game files & Boot Test...");
+  try {
+    const res = await fetch("/api/boot-test?drive=" + encodeURIComponent(drive));
+    const r = await res.json();
+    document.getElementById("bootResultPanel").style.display = "block";
+    document.getElementById("bootSummary").textContent = r.summary || "";
+    document.getElementById("bootTbody").innerHTML = (r.checks || []).map(c =>
+      `<tr><td><b>${esc(c.name)}</b></td><td>${esc(c.track || 'both')}</td><td class="chk-${esc(c.status)}">${esc(c.status)}</td><td>${esc(c.detail)}</td></tr>`
+    ).join("");
+    showToast(`🧪 PC Recomp ${r.recomp_readiness_pct}% · Console Emu ${r.xbox_readiness_pct}%`, "ok");
+    refresh(true);
+  } finally { hideLoader(); }
+}
+async function launchTool(tool) {
+  const drive = currentSettings.auto_download_drive || "D";
+  const res = await fetch("/api/launch-tool", {
+    method: "POST", headers: {"Content-Type":"application/json"},
+    body: JSON.stringify({ tool, drive })
+  });
+  const r = await res.json();
+  showToast(r.ok ? ("🚀 " + (r.message || "Launched")) : ("❌ " + (r.error || "Error")), r.ok ? "ok" : "err");
+}
+async function silentAction(action) {
+  const res = await fetch("/api/silent-watch", {
+    method: "POST", headers: {"Content-Type":"application/json"},
+    body: JSON.stringify({ action, interval_minutes: 60 })
+  });
+  const r = await res.json();
+  if (r.message) showToast("🌙 " + r.message, "ok");
+  checkSchtaskStatus();
+}
+async function checkSchtaskStatus() {
+  const res = await fetch("/api/silent-watch", {
+    method: "POST", headers: {"Content-Type":"application/json"},
+    body: JSON.stringify({ action: "status" })
+  });
+  const r = await res.json();
+  const el = document.getElementById("schtaskState");
+  if (el) el.textContent = r.installed ? "✅ Active (1h)" : "⚪ Inactive";
+}
+
+window.addEventListener("gamepadconnected", updateGamepadBadges);
+window.addEventListener("gamepaddisconnected", updateGamepadBadges);
+const _newsStripEl = document.getElementById("newsStrip");
+if (_newsStripEl) {
+  _newsStripEl.addEventListener("wheel", (e) => {
+    if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
+      _newsStripEl.scrollLeft += e.deltaY;
+      e.preventDefault();
+    }
+  }, { passive: false });
+}
+
+refresh(true);
+// Fast poll while startup splash is syncing, then steady 4s poll
+const _splashPoll = setInterval(() => {
+  if (splashHidden) {
+    clearInterval(_splashPoll);
+    return;
+  }
+  refresh(false);
+}, 450);
+setTimeout(hideSplashOverlay, 12000);
+setInterval(() => refresh(false), 4000);
+</script>
+</body>
+</html>
