@@ -10,7 +10,11 @@
 </p>
 
 <p align="center">
-  <img src="Assets/preview.png" alt="SixDeck Launcher Preview" width="880" />
+  <img src="Assets/preview.png" alt="SixDeck Play Screen Preview" width="880" />
+</p>
+
+<p align="center">
+  <img src="Assets/preview_components.png" alt="SixDeck Components Screen Preview" width="880" />
 </p>
 
 ---
