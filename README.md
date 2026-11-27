@@ -9,6 +9,10 @@
   <i>Handed over to the open-source community — fork it, improve it, optimize it, and make it yours.</i>
 </p>
 
+<p align="center">
+  <img src="Assets/preview.png" alt="SixDeck Launcher Preview" width="880" />
+</p>
+
 ---
 
 ## Important Notices & Disclaimers
