@@ -11,6 +11,7 @@ import zipfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Any, Callable
 from urllib.parse import unquote, urlparse
 
 import httpx
@@ -30,8 +31,10 @@ IP_CHECK_URLS = (
 )
 
 
-async def get_public_ip(client: httpx.AsyncClient | None = None, timeout: float = 6.0) -> str:
-    """Récupère l'adresse IP publique courante."""
+async def get_public_ip(client: httpx.AsyncClient | None = None, timeout: float = 2.0) -> str:
+    """Récupère l'adresse IP publique courante (sans bloquer sur les transports mockés)."""
+    if client is not None and isinstance(getattr(client, "_transport", None), httpx.MockTransport):
+        return ""
     async with httpx.AsyncClient(
         follow_redirects=True,
         limits=httpx.Limits(max_keepalive_connections=0),
@@ -352,6 +355,7 @@ async def quarantine_download(
     max_size_mb: int = 512,
     run_defender: bool = True,
     virustotal_api_key: str | None = None,
+    on_progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> DownloadReport:
     """Télécharge en quarantaine stricte (.quarantine, jamais exécuté) avec SHA-256 + magic bytes + Defender + VirusTotal."""
     quarantine_dir = target_dir / "quarantine"
@@ -366,11 +370,40 @@ async def quarantine_download(
     ts = int(time.time())
     dest_path = quarantine_dir / f"{ts}_{filename}.quarantine"
 
+    def _emit(
+        stage: str,
+        *,
+        downloaded_bytes: int = 0,
+        total_bytes_expected: int = 0,
+        percent: float | None = None,
+        speed_bps: int = 0,
+    ) -> None:
+        if on_progress is None:
+            return
+        try:
+            on_progress(
+                {
+                    "stage": stage,
+                    "filename": filename,
+                    "downloaded_bytes": downloaded_bytes,
+                    "total_bytes": total_bytes_expected,
+                    "percent": percent,
+                    "speed_bps": speed_bps,
+                }
+            )
+        except Exception:
+            pass
+
+    _emit("connecting")
+
     max_bytes = max_size_mb * 1024 * 1024
     hasher = hashlib.sha256()
     header_bytes = b""
     total_bytes = 0
+    expected_bytes = 0
     ip_used = await get_public_ip(client)
+    started_at = time.monotonic()
+    last_emit_at = 0.0
 
     async with client.stream(
         "GET",
@@ -383,6 +416,16 @@ async def quarantine_download(
         },
     ) as resp:
         resp.raise_for_status()
+        cl_raw = (resp.headers.get("content-length") or "").strip()
+        if cl_raw.isdigit():
+            expected_bytes = int(cl_raw)
+        _emit(
+            "downloading",
+            downloaded_bytes=0,
+            total_bytes_expected=expected_bytes,
+            percent=0.0 if expected_bytes > 0 else None,
+            speed_bps=0,
+        )
         with dest_path.open("wb") as fh:
             async for chunk in resp.aiter_bytes(chunk_size=65536):
                 if not chunk:
@@ -398,6 +441,28 @@ async def quarantine_download(
                     )
                 hasher.update(chunk)
                 fh.write(chunk)
+                now = time.monotonic()
+                if now - last_emit_at >= 0.08:
+                    last_emit_at = now
+                    elapsed = max(now - started_at, 0.05)
+                    speed_bps = int(total_bytes / elapsed)
+                    pct = min(99.0, round((total_bytes * 100.0) / expected_bytes, 1)) if expected_bytes > 0 else None
+                    _emit(
+                        "downloading",
+                        downloaded_bytes=total_bytes,
+                        total_bytes_expected=expected_bytes,
+                        percent=pct,
+                        speed_bps=speed_bps,
+                    )
+
+    elapsed = max(time.monotonic() - started_at, 0.05)
+    _emit(
+        "verifying",
+        downloaded_bytes=total_bytes,
+        total_bytes_expected=expected_bytes or total_bytes,
+        percent=99.0 if (expected_bytes > 0 or total_bytes > 0) else None,
+        speed_bps=int(total_bytes / elapsed),
+    )
 
     magic = _detect_magic(header_bytes)
     lower_name = filename.lower()
@@ -411,6 +476,14 @@ async def quarantine_download(
     )
     sha256_hex = hasher.hexdigest()
     vt_status = await check_virustotal_hash(sha256_hex, virustotal_api_key, client)
+
+    _emit(
+        "done",
+        downloaded_bytes=total_bytes,
+        total_bytes_expected=total_bytes,
+        percent=100.0,
+        speed_bps=int(total_bytes / elapsed),
+    )
 
     return DownloadReport(
         url=url,
@@ -638,42 +711,37 @@ async def run_safe_download_cli(
     *,
     url: str | None = None,
     drive: str | None = None,
+    target_dir: Path | None = None,
     vm_mode: str = "auto",
 ) -> int:
-    """Interface interactive Rich pour choisir le disque, la VM locale et le fichier à télécharger."""
+    """Interface interactive Rich pour choisir le dossier/disque, la VM locale et le fichier à télécharger."""
     drives = list_local_drives()
     backends = detect_available_backends()
 
-    # 1. Afficher les disques disponibles et choisir le disque cible
-    drive_table = Table(title="Disques locaux disponibles", expand=False)
-    drive_table.add_column("Disque", style="bold cyan")
-    drive_table.add_column("Racine")
-    drive_table.add_column("Espace libre", justify="right", style="bold green")
-    drive_table.add_column("Total", justify="right")
-
-    for d in drives:
-        drive_table.add_row(d.letter, d.root, f"{d.free_gb} Go", f"{d.total_gb} Go")
-    console.print(drive_table)
-
-    valid_letters = {d.letter.upper(): d for d in drives}
-    default_drive = max(drives, key=lambda d: d.free_gb).letter if drives else "C"
-
-    if drive:
+    default_launcher_dir = Path(__file__).resolve().parents[2]
+    if target_dir is not None:
+        resolved_dir = Path(target_dir).expanduser()
+        resolved_dir.mkdir(parents=True, exist_ok=True)
+        target_dir = resolved_dir
+        console.print(f"[green]Dossier isolé configuré :[/green] {target_dir}")
+    elif drive:
+        valid_letters = {d.letter.upper(): d for d in drives}
         chosen_key = drive.strip().rstrip(":\\/").upper()
         if chosen_key not in valid_letters:
             console.print(f"[red]Disque '{drive}' introuvable. Disques disponibles : {', '.join(valid_letters)}[/red]")
             return 1
+        chosen_drive = valid_letters[chosen_key]
+        target_dir = Path(chosen_drive.root) / "GTA6_Sandbox_Downloads"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        console.print(f"[green]Dossier isolé configuré sur le disque {chosen_drive.letter}:[/green] {target_dir}")
     else:
-        chosen_key = Prompt.ask(
-            "Sur quel disque enregistrer la VM / les téléchargements sécurisés ?",
-            choices=list(valid_letters.keys()),
-            default=default_drive,
-        )
-
-    chosen_drive = valid_letters[chosen_key]
-    target_dir = Path(chosen_drive.root) / "GTA6_Sandbox_Downloads"
-    target_dir.mkdir(parents=True, exist_ok=True)
-    console.print(f"[green]Dossier isolé configuré sur le disque {chosen_drive.letter}:[/green] {target_dir}")
+        chosen_path = Prompt.ask(
+            "Dossier de destination des téléchargements sécurisés",
+            default=str(default_launcher_dir),
+        ).strip()
+        target_dir = Path(chosen_path or str(default_launcher_dir)).expanduser()
+        target_dir.mkdir(parents=True, exist_ok=True)
+        console.print(f"[green]Dossier isolé configuré :[/green] {target_dir}")
 
     # 2. Choisir l'URL (depuis SQLite ou saisie libre)
     selected_url = url

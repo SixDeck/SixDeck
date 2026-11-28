@@ -96,6 +96,19 @@ class Storage:
                 """
             )
             conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS runtime_compat (
+                    runtime_key TEXT PRIMARY KEY,
+                    status TEXT NOT NULL,
+                    fps INTEGER DEFAULT 0,
+                    launches INTEGER DEFAULT 0,
+                    crashes INTEGER DEFAULT 0,
+                    notes TEXT DEFAULT '',
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_downloads_url ON downloads (url)"
             )
             conn.execute(
@@ -455,7 +468,7 @@ class Storage:
                 extra["dependencies"] = deps
 
                 new_score = it.relevance_score
-                if rf is not None and not extra.get("portwatch_verified"):
+                if rf is not None and not (extra.get("portwatch_verified") or extra.get("pc_race_verified")):
                     evaluated = rf.evaluate(it.model_copy(deep=True))
                     if not evaluated.rejected:
                         new_score = evaluated.relevance_score
@@ -606,8 +619,17 @@ class Storage:
             ).fetchall()
 
             for root_dir in sandbox_dirs:
-                for sub in ("quarantine", "vm_incoming"):
-                    folder = root_dir / sub
+                candidate_folders: list[Path] = [
+                    root_dir / "quarantine",
+                    root_dir / "vm_incoming",
+                ]
+                by_role_dir = root_dir / "by_role"
+                if by_role_dir.is_dir():
+                    for rdir in by_role_dir.iterdir():
+                        if rdir.is_dir():
+                            candidate_folders.append(rdir / "quarantine")
+                            candidate_folders.append(rdir / "vm_incoming")
+                for folder in candidate_folders:
                     if not folder.exists():
                         continue
                     for fp in folder.iterdir():
@@ -664,3 +686,98 @@ class Storage:
                         known_paths.add(str(fp))
                         synced += 1
         return synced
+
+    def record_runtime_compat(
+        self,
+        runtime_key: str,
+        status: str,
+        *,
+        fps: int = 0,
+        crashed: bool = False,
+        notes: str = "",
+    ) -> None:
+        """Records local runtime compatibility test results (launches, crashes, best FPS, badge status)."""
+        key = (runtime_key or "").strip().lower()
+        if not key:
+            return
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT launches, crashes, fps FROM runtime_compat WHERE runtime_key = ?",
+                (key,),
+            ).fetchone()
+            launches = (int(row["launches"]) if row else 0) + 1
+            crashes = (int(row["crashes"]) if row else 0) + (1 if crashed else 0)
+            best_fps = max(int(row["fps"]) if row else 0, int(fps or 0))
+            conn.execute(
+                """
+                INSERT INTO runtime_compat (
+                    runtime_key, status, fps, launches, crashes, notes, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(runtime_key) DO UPDATE SET
+                    status = excluded.status,
+                    fps = excluded.fps,
+                    launches = excluded.launches,
+                    crashes = excluded.crashes,
+                    notes = CASE WHEN excluded.notes != '' THEN excluded.notes ELSE runtime_compat.notes END,
+                    updated_at = excluded.updated_at
+                """,
+                (key, status, best_fps, launches, crashes, notes[:240], now_iso),
+            )
+
+    def get_runtime_compat_map(self) -> dict[str, dict]:
+        """Returns all locally recorded runtime compatibility results keyed by normalized runtime key."""
+        out: dict[str, dict] = {}
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM runtime_compat").fetchall()
+            for r in rows:
+                out[r["runtime_key"]] = {
+                    "runtime_key": r["runtime_key"],
+                    "status": r["status"],
+                    "fps": int(r["fps"] or 0),
+                    "launches": int(r["launches"] or 0),
+                    "crashes": int(r["crashes"] or 0),
+                    "notes": r["notes"] or "",
+                    "updated_at": r["updated_at"],
+                }
+        return out
+
+
+def classify_compat_badge(
+    status_text: str = "",
+    *,
+    score_pct: float = 0.0,
+    fps: float = 0.0,
+    local_record: dict | None = None,
+) -> dict[str, str]:
+    """Maps PortWatch VI status/metrics and local results into standardized English compatibility badges."""
+    low = (status_text or "").strip().lower()
+    if local_record:
+        loc_st = str(local_record.get("status") or "").strip().lower()
+        loc_fps = float(local_record.get("fps") or 0)
+        if loc_fps > fps:
+            fps = loc_fps
+        if loc_st in {"parfait", "perfect"}:
+            return {"label": "Perfect", "tier": "perfect"}
+        if loc_st in {"jouable", "playable"}:
+            return {"label": "Playable", "tier": "playable"}
+        if loc_st in {"en jeu", "ingame", "in-game"}:
+            return {"label": "In-Game", "tier": "ingame"}
+        if loc_st in {"menus", "menu", "boots"}:
+            return {"label": "Menus", "tier": "menus"}
+        if loc_st == "crash" and not low:
+            return {"label": "Crash", "tier": "crash"}
+
+    if "crash" in low or "broken" in low or "panicked" in low:
+        return {"label": "Crash", "tier": "crash"}
+    if ("60 fps" in low and "playable" in low) or (score_pct >= 90.0 and fps >= 55):
+        return {"label": "Perfect", "tier": "perfect"}
+    if "playable" in low or "jouable" in low or score_pct >= 55.0:
+        return {"label": "Playable", "tier": "playable"}
+    if "world" in low or "in-game" in low or "en jeu" in low or "render" in low or score_pct >= 32.0:
+        return {"label": "In-Game", "tier": "ingame"}
+    if "menu" in low or "boot" in low or "loads exe" in low or score_pct >= 12.0:
+        return {"label": "Menus", "tier": "menus"}
+    if local_record and int(local_record.get("crashes") or 0) > 0 and int(local_record.get("fps") or 0) == 0:
+        return {"label": "Crash", "tier": "crash"}
+    return {"label": "In Dev", "tier": "dev"}

@@ -6,6 +6,33 @@ from src.models import Category, ScrapedItem
 
 # Règles de détection des rôles (ordonnées selon la chaîne d'assemblage logique)
 ROLE_RULES: list[tuple[str, str, re.Pattern[str]]] = [
+    # Dedicated open-source GPU / Shader translators, probes & RDNA2 ISA tools
+    (
+        "Exécution Dump / Ému",
+        "6. Shaders / GPU",
+        re.compile(
+            r"\b(victory-xcl-graft|rdna2-conformance|rdna2-dis|rdna-isa-ref|leonida-framelab|xbox-hle-lab|dxil-spirv|vkd3d-proton|directxshadercompiler)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    # Dedicated open-source Symbols, Native Handlers & Metadata Config repositories
+    (
+        "PC Natif / Recomp",
+        "4. Symboles / Config",
+        re.compile(
+            r"\b(gta-vi-data-dumps|gta6-stringsdatabase|gta6-modding-sdk)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    # Dedicated open-source Xbox XVD / PS5 SELF-ELF Dumpers & Build Inspectors
+    (
+        "Exécution Dump / Ému",
+        "7. Dumper / ELF-SPRX",
+        re.compile(
+            r"\b(xvdtool|ps5-app-dumper|ps5-self-pager|ps5-self-to-elf|ps5-self-decrypter|xbox-inspector|itemzflow|fself|self\s+decrypt\w*|elf\s+dump\w*|sprx\s+dump\w*|pkg\s+(?:unpacker|extractor)|pfs\s+decrypt\w*|scarlett\s+dump\w*|xbox\s+dump\w*)\b",
+            re.IGNORECASE,
+        ),
+    ),
     (
         "PC Natif / Recomp",
         "1. Portage / Exe PC",
@@ -34,7 +61,7 @@ ROLE_RULES: list[tuple[str, str, re.Pattern[str]]] = [
         "PC Natif / Recomp",
         "4. Symboles / Config",
         re.compile(
-            r"\b(symbols\.toml|recomp_config|\.toml\b|symbol\s+dump|function\s+symbols|pdb|debug\s+symbols|offsets)\b",
+            r"\b(symbols\.toml|recomp_config|\.toml\b|symbol\s+dump|function\s+symbols|pdb|debug\s+symbols|offsets|native\s+handlers?|strings\s*database|hash\s+lookup)\b",
             re.IGNORECASE,
         ),
     ),
@@ -42,7 +69,7 @@ ROLE_RULES: list[tuple[str, str, re.Pattern[str]]] = [
         "PC Natif / Recomp",
         "8. Décompilateur / IA RE",
         re.compile(
-            r"\b(llm4decompile|ai\s+decompil\w*|neural\s+decompil\w*|binary\s+translation|ghidra|ida\s+pro|radare2|binary\s+ninja|decompiler|re\s+toolkit|rage9-re|rageforge|xbox-inspector|rpf9-research|0x52504639|format\s+research|build\s+inspector)\b",
+            r"\b(llm4decompile|ai\s+decompil\w*|neural\s+decompil\w*|binary\s+translation|ghidra|ida\s+pro|radare2|binary\s+ninja|decompiler|re\s+toolkit|rage9-re|rageforge|rpf9-research|0x52504639|format\s+research)\b",
             re.IGNORECASE,
         ),
     ),
@@ -58,7 +85,7 @@ ROLE_RULES: list[tuple[str, str, re.Pattern[str]]] = [
         "Exécution Dump / Ému",
         "6. Shaders / GPU",
         re.compile(
-            r"\b(shader\w*|xshader|spir-v|dxil|gnm|gnmx|vulkan\s+render\w*|dx12\s+(?:shader\w*|render\w*)|directx\s*12|d3d12_xs)\b",
+            r"\b(shader\w*|xshader|spir-v|dxil|rdna2|gfx10\.?3|gnm|gnmx|vulkan\s+render\w*|dx12\s+(?:shader\w*|render\w*)|directx\s*12|d3d12_xs)\b",
             re.IGNORECASE,
         ),
     ),
@@ -66,7 +93,7 @@ ROLE_RULES: list[tuple[str, str, re.Pattern[str]]] = [
         "Exécution Dump / Ému",
         "7. Dumper / ELF-SPRX",
         re.compile(
-            r"\b(dumper|fself|self\s+decrypt|elf\s+dump|sprx\s+dump|memory\s+dump|pkg\s+(?:unpacker|extractor)|pfs\s+decrypt|itemzflow|eboot\.bin|xvd|xvds|scarlett\s+dump|xbox\s+dump)\b",
+            r"\b(dumper|memory\s+dump|eboot\.bin|xvd|xvds|xvc)\b",
             re.IGNORECASE,
         ),
     ),

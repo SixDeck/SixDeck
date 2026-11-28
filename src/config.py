@@ -80,9 +80,30 @@ class AltGitSourceConfig(BaseModel):
     enabled: bool = True
     gitlab_enabled: bool = True
     codeberg_enabled: bool = True
+    sourcehut_enabled: bool = True
     huggingface_enabled: bool = True
+    gitea_instances: list[str] = Field(default_factory=list)
+    sourcehut_repos: list[str] = Field(default_factory=list)
     per_query_limit: int = 15
     queries: list[str] = Field(default_factory=list)
+
+
+class RegistryToolConfig(BaseModel):
+    id: str = ""
+    name: str = ""
+    registry: str  # "crates.io" | "pypi" | "nuget"
+    package: str
+    category: str = "Archives / RPF9"
+    risk: str = "code"
+
+
+class ModHubsConfig(BaseModel):
+    enabled: bool = True
+    nexus_game_domain: str = ""
+    gamebanana_query: str = "GTA"
+    gamebanana_game_id: int = 0
+    rss_feeds: list[dict[str, str]] = Field(default_factory=list)
+    package_registries: list[RegistryToolConfig] = Field(default_factory=list)
 
 
 class RedditSourceConfig(BaseModel):
@@ -139,6 +160,12 @@ class NotificationsConfig(BaseModel):
     milestone_only_alerts: bool = True
 
 
+class SandboxProvenanceConfig(BaseModel):
+    enforce_confirmation: bool = False
+    min_repo_age_days: int = 14
+    trusted_github_owners: list[str] = Field(default_factory=list)
+
+
 class AppConfig(BaseModel):
     general: GeneralConfig = Field(default_factory=GeneralConfig)
     gta6_identifiers: list[str] = Field(default_factory=list)
@@ -148,6 +175,9 @@ class AppConfig(BaseModel):
     technical_bonus_terms: list[str] = Field(default_factory=list)
     blacklist: BlacklistConfig = Field(default_factory=BlacklistConfig)
     github_legitimacy: GitHubLegitimacyConfig = Field(default_factory=GitHubLegitimacyConfig)
+    sandbox_provenance: SandboxProvenanceConfig = Field(default_factory=SandboxProvenanceConfig)
+    mirrors: dict[str, list[str]] = Field(default_factory=dict)
+    mod_hubs: ModHubsConfig = Field(default_factory=ModHubsConfig)
     sources: SourcesConfig = Field(default_factory=SourcesConfig)
     notifications: NotificationsConfig = Field(default_factory=NotificationsConfig)
 
@@ -155,6 +185,8 @@ class AppConfig(BaseModel):
     github_token: str | None = None
     discord_webhook_url: str | None = None
     virustotal_api_key: str | None = None
+    steamgriddb_api_key: str | None = None
+    nexus_api_key: str | None = None
     reddit_user_agent: str = "python:gta6-port-tracker:v3.4.0 (gta6 recomp tech watch)"
 
 
@@ -174,6 +206,8 @@ def load_config(config_path: str | Path = "config.yaml", env_path: str | Path | 
     config.github_token = os.getenv("GITHUB_TOKEN") or None
     config.discord_webhook_url = os.getenv("DISCORD_WEBHOOK_URL") or None
     config.virustotal_api_key = os.getenv("VIRUSTOTAL_API_KEY") or None
+    config.steamgriddb_api_key = os.getenv("STEAMGRIDDB_API_KEY") or None
+    config.nexus_api_key = os.getenv("NEXUS_API_KEY") or None
     env_ua = os.getenv("REDDIT_USER_AGENT")
     if env_ua:
         config.reddit_user_agent = env_ua

@@ -256,6 +256,7 @@ blacklist:
   trusted_archive_domains:
     - "github.com"
     - "gitlab.com"
+    - "gitgud.io"
     - "codeberg.org"
     - "archive.org"
     - "huggingface.co"
@@ -332,6 +333,7 @@ sources:
       - '"xgameruntime" "scarlett"'
     watched_repos:
       - "4lwayz/portwatch-vi"
+      - "vuyp/gta6-pc-race"
       - "Belobug/VIctory-Belobug-AMD"
       - "DexNom/VIctory"
       - "avatarmanz/VIctory-7900XTX"
@@ -352,6 +354,21 @@ sources:
       - "InoriRus/Kyty"
       - "dexyfex/CodeWalker"
       - "hedge-dev/XenonRecomp"
+      - "DurtyFree/gta-vi-data-dumps"
+      - "ahmed605/GTA6-StringsDatabase"
+      - "liam-mcelhaney122/gta6-modding-sdk"
+      - "kalijerry/victory-xcl-graft"
+      - "alexdeliu/rdna2-conformance"
+      - "booomxd/rdna2-dis"
+      - "wifi-revenge/rdna-isa-ref"
+      - "5headsmartbtw/leonida-framelab"
+      - "sub-north/xbox-hle-lab"
+      - "HansKristian-Work/dxil-spirv"
+      - "emoose/xvdtool"
+      - "kry-vex-gta/XBOX-Inspector"
+      - "EchoStretch/ps5-app-dumper"
+      - "idlesauce/ps5-self-pager"
+      - "julienlgy/PS5-SELF-TO-ELF"
     # Filtre commits/PRs sur les gros émulateurs
     watched_filter_terms:
       - "RAGE"
@@ -411,12 +428,18 @@ sources:
     # URLs de threads ou sections techniques suivies directement en plus des threads découverts par Web Dorks
     seed_urls:
       - "https://portwatch-vi.xyz/"
+      - "https://vuyp.github.io/gta6-pc-race/"
 
   alt_git:
     enabled: true
     gitlab_enabled: true
     codeberg_enabled: true
+    sourcehut_enabled: true
     huggingface_enabled: true
+    # Instances Gitea / Forgejo auto-hébergées optionnelles (ex: ["https://git.example.org"])
+    gitea_instances: []
+    # Dépôts SourceHut (git.sr.ht) optionnels (ex: ["~user/repo"])
+    sourcehut_repos: []
     per_query_limit: 15
     queries:
       - "game_scarlett_master"
@@ -467,6 +490,82 @@ sources:
         url: "https://hex-rays.com/blog/feed/"
       - name: "Trail of Bits Blog"
         url: "https://blog.trailofbits.com/feed/"
+
+# Pinning de provenance Sandbox (organisations & auteurs GitHub vérifiés)
+sandbox_provenance:
+  enforce_confirmation: false
+  min_repo_age_days: 14
+  trusted_github_owners:
+    - "4lwayz"
+    - "vuyp"
+    - "Belobug"
+    - "DexNom"
+    - "avatarmanz"
+    - "Zettrox"
+    - "uiliannn"
+    - "fxceless"
+    - "Marvisak"
+    - "xcl-dev"
+    - "DesignWithTommy"
+    - "realblastex"
+    - "lynxnathan"
+    - "breadbbbb"
+    - "holdmysocks"
+    - "nullbrik"
+    - "pagiii"
+    - "Ahmet-Dedeler"
+    - "shadps4-emu"
+    - "InoriRus"
+    - "dexyfex"
+    - "hedge-dev"
+    - "TheoBIET"
+    - "nineforge0"
+    - "rpatty-dev"
+    - "woreksami"
+    - "Librett0"
+    - "Albotterin"
+    - "Two-Play"
+    - "meetox80"
+    - "SixDeck"
+    - "DurtyFree"
+    - "ahmed605"
+    - "liam-mcelhaney122"
+    - "kalijerry"
+    - "alexdeliu"
+    - "booomxd"
+    - "wifi-revenge"
+    - "5headsmartbtw"
+    - "sub-north"
+    - "HansKristian-Work"
+    - "emoose"
+    - "kry-vex-gta"
+    - "EchoStretch"
+    - "idlesauce"
+    - "julienlgy"
+    - "fishingpvalues"
+
+# Miroirs Alt-Git par composant (bascule automatique si GitHub est déplacé ou indisponible)
+# Exemple :
+# mirrors:
+#   "Ahmet-Dedeler/bcpack-rs":
+#     - "https://codeberg.org/community/bcpack-rs"
+#     - "https://gitlab.com/community/bcpack-rs"
+mirrors: {}
+
+# Hubs de modding optionnels (Nexus Mods API, GameBanana API, RSS) & Registres de paquets (Crates.io, PyPI, NuGet)
+mod_hubs:
+  enabled: true
+  nexus_game_domain: ""
+  gamebanana_query: "GTA VI"
+  gamebanana_game_id: 0
+  rss_feeds: []
+  package_registries:
+    - id: "bcpack-rs"
+      name: "BCPack-RS (Texture Codec)"
+      registry: "crates.io"
+      package: "bcpack-rs"
+      category: "Textures & Shaders"
+      risk: "code"
 
 # Notifications & Exports
 notifications:

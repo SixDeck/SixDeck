@@ -50,6 +50,13 @@ class AltGitScraper(BaseScraper):
                 batch.extend(await self._search_codeberg(query, cfg.per_query_limit))
                 await self._jitter(scale=0.5)
 
+            for gitea_base in (cfg.gitea_instances or []):
+                self._emit_status(
+                    f"Gitea {gitea_base} ({q_idx}/{len(cfg.queries)}: {query})", on_status
+                )
+                batch.extend(await self._search_gitea_instance(gitea_base, query, cfg.per_query_limit))
+                await self._jitter(scale=0.4)
+
             if cfg.huggingface_enabled:
                 self._emit_status(
                     f"HuggingFace ({q_idx}/{len(cfg.queries)}: {query})", on_status
@@ -66,6 +73,17 @@ class AltGitScraper(BaseScraper):
             if fresh:
                 all_items.extend(fresh)
                 await self._emit_batch(fresh, on_batch)
+
+        # SourceHut (git.sr.ht) RSS log monitoring for configured repositories
+        if cfg.sourcehut_enabled and cfg.sourcehut_repos:
+            self._emit_status(f"SourceHut ({len(cfg.sourcehut_repos)} dépôts)", on_status)
+            srht_items = await self._fetch_sourcehut_repos(cfg.sourcehut_repos)
+            fresh_srht = [it for it in srht_items if it.url not in seen_urls]
+            for it in fresh_srht:
+                seen_urls.add(it.url)
+            if fresh_srht:
+                all_items.extend(fresh_srht)
+                await self._emit_batch(fresh_srht, on_batch)
 
         self._emit_status(f"Cycle terminé ({len(all_items)} bruts)", on_status)
         return all_items
@@ -174,6 +192,86 @@ class AltGitScraper(BaseScraper):
                     tags=tags,
                     score_engagement=int(repo.get("stars_count") or 0),
                     extra={"platform": "codeberg", "query": query},
+                )
+            )
+        return items
+
+    async def _search_gitea_instance(self, base_url: str, query: str, limit: int) -> list[ScrapedItem]:
+        """Connecteur dédié pour les instances Gitea / Forgejo auto-hébergées."""
+        base = (base_url or "").strip().rstrip("/")
+        if not base:
+            return []
+        if not base.startswith(("http://", "https://")):
+            base = f"https://{base}"
+        resp = await self._request(
+            "GET",
+            f"{base}/api/v1/repos/search",
+            params={"q": query, "sort": "updated", "order": "desc", "limit": min(limit, 30)},
+            headers={"User-Agent": "SixDeck-AltGit/1.0"},
+        )
+        if resp is None or resp.status_code != 200:
+            return []
+        try:
+            payload = resp.json()
+        except ValueError:
+            return []
+        repos = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(repos, list):
+            return []
+
+        items: list[ScrapedItem] = []
+        for repo in repos:
+            if not isinstance(repo, dict):
+                continue
+            url = repo.get("html_url") or ""
+            full_name = repo.get("full_name") or ""
+            if not url or not full_name:
+                continue
+            desc = (repo.get("description") or "").strip()
+            lang = repo.get("language")
+            items.append(
+                ScrapedItem(
+                    id=ScrapedItem.build_id(SourceType.CODEBERG, f"gitea:{url.lower()}"),
+                    source=SourceType.CODEBERG,
+                    title=f"[Gitea] {full_name}",
+                    url=url,
+                    summary=desc[:600],
+                    author=(repo.get("owner") or {}).get("login", "gitea"),
+                    published_at=repo.get("created_at"),
+                    updated_at=repo.get("updated_at"),
+                    tags=["gitea", "forgejo"] + ([lang] if lang else []),
+                    score_engagement=int(repo.get("stars_count") or 0),
+                    extra={"platform": "gitea", "instance": base, "query": query},
+                )
+            )
+        return items
+
+    async def _fetch_sourcehut_repos(self, repo_urls: list[str]) -> list[ScrapedItem]:
+        """Connecteur dédié SourceHut (git.sr.ht) via flux RSS natif /log/rss.xml."""
+        from src.utils.alt_git_mirrors import fetch_forge_latest_info
+
+        items: list[ScrapedItem] = []
+        for raw in repo_urls:
+            url = (raw or "").strip()
+            if not url.startswith("http"):
+                url = f"https://git.sr.ht/{url.lstrip('/')}"
+            info = await fetch_forge_latest_info(url, self.client, timeout=self.config.general.request_timeout)
+            if not info.get("ok"):
+                continue
+            commits = info.get("commits") or []
+            latest = commits[0] if commits else {}
+            repo_name = str(info.get("repo") or url)
+            items.append(
+                ScrapedItem(
+                    id=ScrapedItem.build_id(SourceType.CODEBERG, f"srht:{repo_name.lower()}"),
+                    source=SourceType.CODEBERG,
+                    title=f"[SourceHut] {repo_name}",
+                    url=url,
+                    summary=str(latest.get("message") or f"SourceHut repository {repo_name}")[:500],
+                    author=str(latest.get("author") or "sourcehut"),
+                    updated_at=latest.get("date") or datetime.now(timezone.utc).isoformat(),
+                    tags=["sourcehut", "alt-git"],
+                    extra={"platform": "sourcehut", "commits": commits[:5]},
                 )
             )
         return items

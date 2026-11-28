@@ -1,0 +1,87 @@
+name: Build Windows Executable
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Verify clean build workspace (no personal files)
+        shell: pwsh
+        run: |
+          $forbidden = @(".env", "data", "reports", "Mods", "portable_data", "gta6_safe_download.wsb")
+          foreach ($item in $forbidden) {
+            if (Test-Path $item) {
+              Write-Error "Forbidden local/personal file or directory present in workspace: $item"
+              exit 1
+            }
+          }
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run test suite
+        shell: pwsh
+        run: python -m pytest -q
+
+      - name: Build SixDeck.exe
+        shell: pwsh
+        run: .\build_exe.ps1
+
+      - name: Verify build output
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "SixDeck.exe")) { throw "SixDeck.exe was not generated" }
+          if (-not (Test-Path "SixDeck.exe.sha256")) { throw "SixDeck.exe.sha256 was not generated" }
+          Get-Item "SixDeck.exe" | Select-Object Name, Length
+          Get-Content "SixDeck.exe.sha256"
+
+      - name: Upload SixDeck Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SixDeck-windows-x64
+          path: |
+            SixDeck.exe
+            SixDeck.exe.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build-windows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: SixDeck-windows-x64
+          path: release-assets
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            release-assets/SixDeck.exe
+            release-assets/SixDeck.exe.sha256

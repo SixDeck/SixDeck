@@ -499,6 +499,51 @@ class GitHubScraper(BaseScraper):
         *,
         on_status: StatusCallback | None = None,
     ) -> list[ScrapedItem]:
+        from src.utils.github_atom import fetch_github_releases_atom
+
+        # 1. Flux Atom natif (/releases.atom) : gratuit, rapide et sans quota REST API
+        atom_rels = await fetch_github_releases_atom(
+            repo_full_name, self.client, timeout=self.config.general.request_timeout
+        )
+        if atom_rels:
+            atom_items: list[ScrapedItem] = []
+            for rel in atom_rels[:6]:
+                dt_str = rel.get("date") or ""
+                if dt_str:
+                    try:
+                        pub_dt = datetime.fromisoformat(dt_str.replace(" ", "T")).replace(tzinfo=timezone.utc)
+                        if pub_dt < since_dt:
+                            continue
+                    except ValueError:
+                        pass
+                tag_name = rel.get("tag") or "release"
+                name = rel.get("name") or tag_name
+                html_url = rel.get("url") or f"https://github.com/{repo_full_name}/releases/tag/{tag_name}"
+                body = rel.get("notes") or ""
+                author = rel.get("author") or repo_full_name.split("/")[0]
+                atom_items.append(
+                    ScrapedItem(
+                        id=ScrapedItem.build_id(SourceType.GITHUB_RELEASE, f"{repo_full_name}@{tag_name}"),
+                        source=SourceType.GITHUB_RELEASE,
+                        title=f"[Release] {repo_full_name} — {name}",
+                        url=html_url,
+                        summary=body[:600],
+                        author=author,
+                        published_at=dt_str or None,
+                        updated_at=dt_str or None,
+                        tags=["release", "atom", tag_name, repo_full_name.split("/")[-1]],
+                        score_engagement=50,
+                        github_meta=GitHubMetadata(
+                            repo_full_name=repo_full_name,
+                            primary_language="C++",
+                            owner_login=author,
+                        ),
+                    )
+                )
+            if atom_items or not self.config.github_token:
+                return atom_items
+
+        # 2. Fallback REST API uniquement si un token est configuré ou si le flux Atom était vide
         data = await self._gh_get(
             f"/repos/{repo_full_name}/releases",
             params={"per_page": 5},
@@ -587,6 +632,54 @@ class GitHubScraper(BaseScraper):
         *,
         on_status: StatusCallback | None = None,
     ) -> list[ScrapedItem]:
+        from src.utils.github_atom import fetch_github_commits_atom
+
+        # 1. Flux Atom natif (/commits/<branch>.atom) : zéro quota API REST GitHub
+        atom_commits = await fetch_github_commits_atom(
+            repo_full_name,
+            self.client,
+            timeout=self.config.general.request_timeout,
+            limit=limit,
+        )
+        if atom_commits:
+            atom_items: list[ScrapedItem] = []
+            for entry in atom_commits:
+                dt_str = entry.get("date") or ""
+                if dt_str:
+                    try:
+                        c_dt = datetime.fromisoformat(dt_str.replace(" ", "T")).replace(tzinfo=timezone.utc)
+                        if c_dt < since_dt:
+                            continue
+                    except ValueError:
+                        pass
+                sha = entry.get("full_sha") or entry.get("sha") or ""
+                html_url = entry.get("url") or f"https://github.com/{repo_full_name}/commit/{sha}"
+                msg = entry.get("message") or ""
+                if not sha or not msg:
+                    continue
+                author_login = entry.get("author") or "unknown"
+                atom_items.append(
+                    ScrapedItem(
+                        id=ScrapedItem.build_id(SourceType.GITHUB_COMMIT, f"{repo_full_name}@{sha}"),
+                        source=SourceType.GITHUB_COMMIT,
+                        title=f"[Commit] {repo_full_name}: {msg[:140]}",
+                        url=html_url,
+                        summary=msg[:500],
+                        author=author_login,
+                        published_at=dt_str or None,
+                        updated_at=dt_str or None,
+                        tags=["commit", "atom", repo_full_name.split("/")[-1]],
+                        score_engagement=15,
+                        github_meta=GitHubMetadata(
+                            repo_full_name=repo_full_name,
+                            primary_language="C++",
+                            owner_login=author_login,
+                        ),
+                    )
+                )
+            if atom_items or not self.config.github_token:
+                return atom_items
+
         data = await self._gh_get(
             f"/repos/{repo_full_name}/commits",
             params={"since": since_dt.isoformat(), "per_page": limit},

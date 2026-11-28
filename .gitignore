@@ -23,12 +23,22 @@ __pycache__/
 build/
 dist/
 *.exe
+*.exe.sha256
 *.spec
 
-# Local game dumps, saves & runtimes (NEVER commit)
+# Local game dumps, saves, downloads & runtimes (NEVER commit)
 game/
 runtimes/
 vendor/
 lab/
+by_role/
+Mods/
+mod_stage/
+portable.flag
+portable_data/
+quarantine/
+vm_incoming/
+vm_scripts/
+*.wsb
 *.rpf
 *.xvd

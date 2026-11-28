@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import tempfile
@@ -8,6 +9,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from src.sandbox.vm_downloader import detect_available_backends
+from src.utils.hw_advisor import (
+    detect_avx2,
+    find_linux_compat_runner,
+    get_system_memory_cross_platform,
+    is_process_elevated,
+    resolve_gdk_title_exe,
+)
 
 
 @dataclass
@@ -45,7 +53,7 @@ def _check_cmd_version(
 ) -> tuple[bool, str, str | None]:
     exe = _resolve_exe(cmd, fallback_paths)
     if not exe:
-        return False, "Non installé", None
+        return False, "Not installed", None
     try:
         proc = subprocess.run(
             [exe, *args],
@@ -103,6 +111,55 @@ def run_boot_and_compile_test(
             track="both",
         )
     )
+
+    # 1b. Hardware & System Safeguards (AVX2, Elevation/Shader Cache, Pagefile/Swap, Linux Proton)
+    has_avx2 = detect_avx2()
+    checks.append(
+        BootCheckItem(
+            "CPU AVX2 Support",
+            "PASS" if has_avx2 else "FAIL",
+            "AVX2 supported" if has_avx2 else "CPU lacks AVX2 (required by GDK compatibility layers)",
+            track="xbox",
+        )
+    )
+
+    elevated = is_process_elevated()
+    checks.append(
+        BootCheckItem(
+            "User Privilege (Shader Cache Sharing)",
+            "WARN" if elevated else "PASS",
+            "Running as Admin/Root — NVIDIA isolates elevated shader caches; relaunch normally"
+            if elevated
+            else "Standard user (shader caches shared normally)",
+            track="xbox",
+        )
+    )
+
+    mem_stats = get_system_memory_cross_platform()
+    ram_gb = float(mem_stats.get("total_ram_gb") or 0.0)
+    pf_gb = float(mem_stats.get("pagefile_gb") or 0.0)
+    if ram_gb > 0:
+        low_pf = bool(mem_stats.get("low_pagefile", False))
+        checks.append(
+            BootCheckItem(
+                "System RAM & Virtual Memory (Pagefile / Swap)",
+                "WARN" if low_pf else "PASS",
+                f"{ram_gb:.1f} GB RAM · {pf_gb:.1f} GB pagefile/swap"
+                + (" (16+ GB recommended on <=20 GB PCs)" if low_pf else " (OK)"),
+                track="both",
+            )
+        )
+
+    if os.name != "nt":
+        proton = find_linux_compat_runner()
+        checks.append(
+            BootCheckItem(
+                "Linux Windows Runtime (Proton / umu-run / Wine)",
+                "PASS" if proton else "WARN",
+                f"{proton['kind']} ({proton['path']})" if proton else "Not detected (install umu-run, Steam Proton, or Wine)",
+                track="xbox",
+            )
+        )
 
     # 2. Optional Sandbox Isolation & Compiled Direct Runtimes (cool_fox / ScarlettPort / VIctory / xcl)
     backends = detect_available_backends()
@@ -213,9 +270,9 @@ def run_boot_and_compile_test(
     if not collected_files:
         checks.append(
             BootCheckItem(
-                "Fichiers collectés",
+                "Collected Files",
                 "FAIL",
-                f"Aucun fichier trouvé dans {sandbox_root}",
+                f"No files found in {sandbox_root}",
                 track="both",
             )
         )
@@ -223,10 +280,10 @@ def run_boot_and_compile_test(
         empty_files = [f.name for f in collected_files if f.stat().st_size == 0]
         checks.append(
             BootCheckItem(
-                "Intégrité des fichiers collectés",
+                "Collected Files Integrity",
                 "WARN" if empty_files else "PASS",
-                f"{len(collected_files)} fichier(s) présent(s)"
-                + (f" ({len(empty_files)} vide(s))" if empty_files else ", tous non vides"),
+                f"{len(collected_files)} file(s) present"
+                + (f" ({len(empty_files)} empty)" if empty_files else ", all non-empty"),
                 track="both",
             )
         )
@@ -262,18 +319,24 @@ def run_boot_and_compile_test(
         )
     )
 
-    # Pillar 3: User-supplied local dump (game_scarlett_master.exe / eboot.bin / *.rpf)
+    # Pillar 3: User-supplied local dump (MicrosoftGame.Config / game_scarlett_master.exe / eboot.bin / *.rpf)
     dump_found = False
     dump_detail = "No local dump detected — use 'Import Dump' in Settings to select your dump folder."
     candidate_dump_dirs = [d for d in (dump_folder, sandbox_root / "local_dump") if d]
     for ddir in candidate_dump_dirs:
         if ddir.exists():
+            resolved_gdk = resolve_gdk_title_exe(ddir, allow_fallback=False)
+            if resolved_gdk:
+                dump_found = True
+                exe_name = Path(resolved_gdk["exe"]).name
+                dump_detail = f"Verified via {resolved_gdk['source']}: {exe_name} in {ddir}"
+                break
             matches = [
                 f.name
                 for f in ddir.rglob("*")
                 if f.is_file()
                 and (
-                    f.name.lower() in {"game_scarlett_master.exe", "eboot.bin"}
+                    f.name.lower() in {"game_scarlett_master.exe", "eboot.bin", "microsoftgame.config"}
                     or f.suffix.lower() in {".rpf", ".elf", ".sprx", ".xvd"}
                 )
             ]
@@ -344,9 +407,9 @@ def run_boot_and_compile_test(
     if zip_ok or zip_bad:
         checks.append(
             BootCheckItem(
-                "Intégrité archives ZIP",
+                "ZIP Archive Integrity",
                 "PASS" if zip_bad == 0 else "WARN",
-                f"{zip_ok} archive(s) valide(s), {zip_bad} corrompue(s)",
+                f"{zip_ok} valid archive(s), {zip_bad} corrupted",
                 track="both",
             )
         )
@@ -356,12 +419,12 @@ def run_boot_and_compile_test(
         if compiled_ok:
             parts.append(f"{compiled_ok} OK")
         if compiled_fail:
-            parts.append(f"{compiled_fail} avec headers externes manquants")
+            parts.append(f"{compiled_fail} with missing external headers")
         if html_skipped:
-            parts.append(f"{html_skipped} page(s) HTML GitHub (re-téléchargez)")
+            parts.append(f"{html_skipped} HTML page(s) skipped (re-download)")
         checks.append(
             BootCheckItem(
-                "Test syntaxe C++20 (clang++ -fsyntax-only)",
+                "C++20 Syntax Check (clang++ -fsyntax-only)",
                 "PASS" if (compiled_fail == 0 and html_skipped == 0) else "WARN",
                 ", ".join(parts),
                 track="recomp",

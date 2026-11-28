@@ -32,9 +32,14 @@ import httpx
 
 from src.config import AppConfig, load_config
 from src.filters.relevance import RelevanceFilter
-from src.models import ScrapedItem
+from src.models import Category, ScrapedItem, SourceType
 from src.notifiers.alerts import is_milestone_item, send_windows_toast
 from src.notifiers.markdown_export import update_daily_markdown_report
+from src.sandbox.provenance import (
+    DEFAULT_TRUSTED_GITHUB_OWNERS,
+    check_provenance_async,
+    evaluate_provenance,
+)
 from src.sandbox.vm_downloader import (
     detect_available_backends,
     generate_inspection_sandbox_wsb,
@@ -47,20 +52,58 @@ from src.scrapers.alt_git_scraper import AltGitScraper
 from src.scrapers.base import BaseScraper
 from src.scrapers.forum_scraper import ForumScraper
 from src.scrapers.github_scraper import GitHubScraper
+from src.scrapers.pc_race_scraper import PcRaceScraper, load_pc_race_snapshot
 from src.scrapers.portwatch_scraper import PortWatchScraper, load_portwatch_snapshot
 from src.scrapers.reddit_scraper import RedditScraper
 from src.scrapers.rss_scraper import RSSScraper
 from src.scrapers.web_dork_scraper import WebDorkScraper
-from src.storage import Storage
+from src.storage import Storage, classify_compat_badge
+from src.utils.alt_git_mirrors import download_with_mirror_fallback, get_mirrors_for_url
 from src.utils.boot_tester import run_boot_and_compile_test
 from src.utils.curated_discovery import (
+    build_curated_component_items,
     discover_curated_repos,
     fetch_whats_new,
     load_discovered_repos,
 )
+from src.utils.dump_verifier import build_local_manifest, verify_dump_directory
+from src.utils.hw_advisor import (
+    decode_exit_code,
+    detect_hardware_profile,
+    get_system_memory_cross_platform,
+    resolve_gdk_title_exe,
+    score_runtime_for_hardware,
+)
+from src.utils.mod_hubs import fetch_gamebanana_mods, fetch_modding_rss_feeds, fetch_nexus_mods
 from src.utils.mods_manager import WORKSHOP_CATALOG, ModsManager
+from src.utils.package_registries import resolve_registry_package
+from src.utils.presets import (
+    export_preset,
+    fetch_remote_presets,
+    get_presets_for_gpu,
+    parse_preset_input,
+)
+from src.utils.profiles import PROFILE_SETTING_KEYS, ProfileManager
 from src.utils.role_classifier import classify_role_and_deps
+from src.utils.shader_progress import (
+    ShaderProgressTracker,
+    build_shared_profile_env,
+    build_superbuild_play_args,
+    fetch_d3d12_agility_sdk,
+    inspect_upscaler_sdk_state,
+    load_timing_history,
+    save_timing_history,
+)
 from src.utils.status_analyzer import infer_simple_status
+from src.utils.steam_shortcut import export_steam_shortcut
+from src.utils.support_bundle import generate_support_bundle
+from src.utils.sys_optimizer import (
+    apply_runtime_process_tuning,
+    prepare_system_for_launch,
+    restore_system_after_launch,
+    set_windows_gpu_preference,
+    wrap_command_for_linux_compat,
+)
 
 BASE_DIR = (
     Path(sys.executable).resolve().parent
@@ -72,6 +115,7 @@ ASSETS_DIR = (BASE_DIR / "Assets") if (BASE_DIR / "Assets").exists() else (BUNDL
 CONFIG_PATH = (BASE_DIR / "config.yaml") if (BASE_DIR / "config.yaml").exists() else (BUNDLE_DIR / "config.yaml")
 DISCOVERED_CACHE = BASE_DIR / "data" / "discovered_repos.json"
 PORTWATCH_SNAPSHOT = BASE_DIR / "data" / "portwatch_snapshot.json"
+PC_RACE_SNAPSHOT = BASE_DIR / "data" / "pc_race_snapshot.json"
 LAUNCHER_SETTINGS_PATH = BASE_DIR / "data" / "launcher_settings.json"
 MODS_STATE_PATH = BASE_DIR / "data" / "mods_state.json"
 SILENT_TASK_NAME = "GTA6_Port_Tracker_SilentWatch"
@@ -91,6 +135,17 @@ ALL_ROLES: tuple[tuple[str, str], ...] = (
 
 def _safe_role_folder(role: str) -> str:
     return SAFE_FOLDER_RE.sub("_", role).strip("_") or "Divers"
+
+
+def _open_folder_in_os(path: Path) -> None:
+    """Opens a directory in the native OS file manager (Windows / macOS / Linux)."""
+    path.mkdir(parents=True, exist_ok=True)
+    if os.name == "nt":
+        os.startfile(str(path))  # type: ignore[attr-defined]
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", str(path)])
+    else:
+        subprocess.Popen(["xdg-open", str(path)])
 
 
 def replace_previous_role_files(role_quarantine_dir: Path, keep_file: Path) -> list[str]:
@@ -122,14 +177,12 @@ def replace_previous_role_files(role_quarantine_dir: Path, keep_file: Path) -> l
 class TrackerController:
     """Contrôleur du Launcher GTA VI : 2 voies (Recomp PC & Ému Xbox Series), auto-découverte, test boot, veille silencieuse."""
 
-    def __init__(self, config: AppConfig) -> None:
+    def __init__(self, config: AppConfig, *, skip_warmup: bool = False) -> None:
         self.config = config
         self.storage = Storage(BASE_DIR / config.general.db_path)
         drives = list_local_drives()
-        sandbox_dirs = [Path(d.root) / "GTA6_Sandbox_Downloads" for d in drives]
-        self.storage.sync_quarantine_folders(sandbox_dirs)
 
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._stop_event = threading.Event()
         self._worker_thread: threading.Thread | None = None
 
@@ -159,22 +212,53 @@ class TrackerController:
         self._prewarm_state: str = "idle"
         self._prewarm_detail: str = ""
         self._prewarm_runtime: str = ""
+        self._prewarm_progress: dict[str, Any] | None = None
+        self._hw_profile_cache: dict[str, Any] | None = None
+        self._hw_profile_ts: float = 0.0
+        self._sdk_fetch_running: bool = False
+        self._active_downloads: dict[str, dict[str, Any]] = {}
+        self._dump_verify_state: dict[str, Any] = {
+            "running": False,
+            "progress": None,
+            "report": None,
+            "error": "",
+        }
+        self._dump_verify_cancel = threading.Event()
 
         self.auto_download_enabled: bool = True
         self.auto_download_min_score: int = 75
-        self.auto_download_drive: str = max(drives, key=lambda d: d.free_gb).letter if drives else "D"
         self.gpu_profile: str = "NVIDIA"  # "NVIDIA" | "AMD" | "ALL"
 
-        # Paramètres persistants du Launcher (FPS, Logs, Répertoire, Runtime, Sandboxie, Vanilla)
+        # Paramètres persistants du Launcher (FPS, Logs, Répertoire, Téléchargements, Runtime, Sandboxie, Vanilla)
         self.settings: dict[str, Any] = self._load_launcher_settings()
         self.gpu_profile = str(self.settings.get("gpu_profile") or "NVIDIA").upper()
         self.auto_download_enabled = bool(self.settings.get("auto_download_enabled", True))
-        if self.settings.get("auto_download_drive"):
-            self.auto_download_drive = str(self.settings["auto_download_drive"]).upper()
+        self.downloads_dir: Path = self._normalize_downloads_dir(self.settings.get("downloads_dir"))
+        self.settings["downloads_dir"] = str(self.downloads_dir)
+        self.auto_download_drive: str = self._drive_label_for_path(self.downloads_dir)
+        self.settings["auto_download_drive"] = self.auto_download_drive
+
+        sandbox_dirs: list[Path] = [self.downloads_dir]
+        for d in drives:
+            legacy_sb = Path(d.root) / "GTA6_Sandbox_Downloads"
+            if legacy_sb.exists() and legacy_sb not in sandbox_dirs:
+                sandbox_dirs.append(legacy_sb)
+        self.storage.sync_quarantine_folders(sandbox_dirs)
+        try:
+            self.storage.save_new_items(build_curated_component_items())
+        except Exception:
+            pass
+
+        self.profiles = ProfileManager(BASE_DIR)
+        prof_info = self.profiles.list_profiles()
+        self.active_profile: str = str(self.settings.get("active_profile") or prof_info.get("active_profile") or "default")
+        if self.profiles.get_profile(self.active_profile) is None:
+            self.active_profile = "default"
+        self.settings["active_profile"] = self.active_profile
 
         self.mods = ModsManager(
-            MODS_STATE_PATH,
-            Path(f"{self.auto_download_drive}:\\") / "GTA6_Sandbox_Downloads" / "Mods",
+            self.profiles.mods_state_path_for(self.active_profile, MODS_STATE_PATH),
+            self.downloads_dir / "Mods",
         )
 
         self._cached_drives = drives
@@ -189,8 +273,93 @@ class TrackerController:
             "summary": "Run Environment Check to inspect both tracks.",
             "checks": [],
         }
-        # Calcul rapide initial en arrière-plan pour afficher les 2 jauges immédiatement
-        threading.Thread(target=self._warmup_boot_cache, daemon=True).start()
+        if skip_warmup:
+            self._startup_sync_done = True
+            self._startup_stage = "Ready"
+        else:
+            # Fast background warmup to display readiness gauges immediately
+            threading.Thread(target=self._warmup_boot_cache, daemon=True).start()
+
+    @classmethod
+    def _portable_flag_path(cls) -> Path:
+        return BASE_DIR / "portable.flag"
+
+    def is_portable_mode(self) -> bool:
+        return self._portable_flag_path().exists() or bool(self.settings.get("portable_mode", False))
+
+    def _runtime_appdata_root(self) -> Path:
+        if self.is_portable_mode():
+            d = BASE_DIR / "portable_data"
+            d.mkdir(parents=True, exist_ok=True)
+            return d
+        return self._local_appdata()
+
+    @classmethod
+    def _resolve_portable_path(cls, raw: str | Path | None, fallback: Path) -> Path:
+        if raw is None or not str(raw).strip():
+            return fallback
+        p = Path(str(raw).strip()).expanduser()
+        if not p.is_absolute():
+            return (BASE_DIR / p).resolve()
+        return p
+
+    @classmethod
+    def _serialize_portable_path(cls, raw: str | Path | None) -> str:
+        if raw is None or not str(raw).strip():
+            return ""
+        p = Path(str(raw).strip()).expanduser()
+        if not p.is_absolute():
+            return p.as_posix()
+        try:
+            rel = p.resolve().relative_to(BASE_DIR.resolve())
+            return "." if str(rel) in {"", "."} else rel.as_posix()
+        except ValueError:
+            return str(p)
+
+    def toggle_portable_mode(self, enabled: bool) -> dict[str, Any]:
+        """Enables or disables Portable Mode using portable.flag and relative paths inside BASE_DIR."""
+        flag = self._portable_flag_path()
+        try:
+            if enabled:
+                flag.write_text("SixDeck Portable Mode enabled — all paths stay relative to this directory.\n", encoding="utf-8")
+                (BASE_DIR / "portable_data" / "6ixpack" / "save").mkdir(parents=True, exist_ok=True)
+            else:
+                flag.unlink(missing_ok=True)
+        except OSError as exc:
+            return {"ok": False, "error": str(exc)}
+
+        patch: dict[str, Any] = {"portable_mode": bool(enabled)}
+        if enabled:
+            # Ensure downloads_dir stays inside BASE_DIR if currently outside
+            try:
+                self.downloads_dir.resolve().relative_to(BASE_DIR.resolve())
+            except ValueError:
+                patch["downloads_dir"] = str(BASE_DIR)
+        res = self.update_launcher_settings(patch)
+        if res.get("ok"):
+            self._add_auto_log(f"🎒 Portable Mode {'ENABLED (portable.flag created)' if enabled else 'DISABLED'}.")
+        return {"ok": bool(res.get("ok")), "portable_mode": self.is_portable_mode(), "flag_path": str(flag), "settings": dict(self.settings)}
+
+    @classmethod
+    def _default_downloads_dir(cls) -> Path:
+        """Default installation/download directory for components & mods: the launcher's own directory."""
+        return BASE_DIR
+
+    @classmethod
+    def _normalize_downloads_dir(cls, raw: str | Path | None) -> Path:
+        if raw is None or not str(raw).strip():
+            return cls._default_downloads_dir()
+        return cls._resolve_portable_path(raw, cls._default_downloads_dir())
+
+    @staticmethod
+    def _drive_label_for_path(path: Path) -> str:
+        try:
+            resolved = path.resolve()
+        except OSError:
+            resolved = path
+        if resolved.drive:
+            return resolved.drive.rstrip(":\\/").upper()
+        return resolved.anchor or "/"
 
     @staticmethod
     def _local_appdata() -> Path:
@@ -201,9 +370,9 @@ class TrackerController:
 
     @classmethod
     def _discover_default_game_dir(cls) -> str:
-        """Détecte automatiquement le dossier du jeu (portable ./game puis disques locaux), sans chemin codé en dur."""
+        """Détecte automatiquement le dossier du jeu (MicrosoftGame.Config ou game_scarlett_master.exe), sans chemin codé en dur."""
         portable_game = BASE_DIR / "game"
-        if (portable_game / "game_scarlett_master.exe").exists():
+        if resolve_gdk_title_exe(portable_game, allow_fallback=False):
             return str(portable_game)
         fallback_dump: Path | None = None
         for drv in list_local_drives():
@@ -212,23 +381,32 @@ class TrackerController:
                 continue
             if fallback_dump is None:
                 fallback_dump = dump_root
-            if (dump_root / "game_scarlett_master.exe").exists():
+            if resolve_gdk_title_exe(dump_root, allow_fallback=False):
                 # Vérifier s'il existe un sous-dossier contenant aussi des .rpf
                 for sub in dump_root.rglob("game_scarlett_master.exe"):
                     if sub.parent != dump_root and any(sub.parent.glob("*.rpf")):
                         return str(sub.parent)
                 return str(dump_root)
+            for cfg in dump_root.rglob("MicrosoftGame.Config"):
+                if resolve_gdk_title_exe(cfg.parent, allow_fallback=False):
+                    return str(cfg.parent)
             for sub in dump_root.rglob("game_scarlett_master.exe"):
                 return str(sub.parent)
         return str(fallback_dump or portable_game)
 
     @classmethod
-    def _discover_runtime_roots(cls, custom_dir: str = "") -> list[Path]:
-        """Retourne les dossiers candidats contenant des runtimes compilés (portable ./runtimes + disques locaux)."""
+    def _discover_runtime_roots(cls, custom_dir: str = "", downloads_dir: Path | None = None) -> list[Path]:
+        """Retourne les dossiers candidats contenant des runtimes compilés (portable ./runtimes, ./runners + downloads_dir + disques locaux)."""
         roots: list[Path] = []
         if custom_dir and Path(custom_dir).exists():
             roots.append(Path(custom_dir))
-        for p in (BASE_DIR / "runtimes", BASE_DIR / "vendor"):
+        if downloads_dir and downloads_dir.exists():
+            roots.append(downloads_dir)
+            for sub in ("runtimes", "runners", "vendor", "by_role"):
+                cand = downloads_dir / sub
+                if cand.exists():
+                    roots.append(cand)
+        for p in (BASE_DIR / "runtimes", BASE_DIR / "runners", BASE_DIR / "vendor"):
             if p.exists():
                 roots.append(p)
         for drv in list_local_drives():
@@ -250,48 +428,26 @@ class TrackerController:
 
     @staticmethod
     def _get_system_memory() -> dict[str, Any]:
-        """Lit la RAM libre et la mémoire virtuelle (commit) via GlobalMemoryStatusEx (<1 ms)."""
-        if os.name != "nt":
-            return {"total_ram_gb": 0.0, "free_ram_gb": 0.0, "total_commit_gb": 0.0, "free_commit_gb": 0.0, "low_memory": False}
-        try:
-            import ctypes
+        """Lit la RAM libre, le swap/pagefile et la mémoire virtuelle (commit) sous Windows et Linux (<1 ms)."""
+        return get_system_memory_cross_platform()
 
-            class MEMORYSTATUSEX(ctypes.Structure):
-                _fields_ = [
-                    ("dwLength", ctypes.c_ulong),
-                    ("dwMemoryLoad", ctypes.c_ulong),
-                    ("ullTotalPhys", ctypes.c_ulonglong),
-                    ("ullAvailPhys", ctypes.c_ulonglong),
-                    ("ullTotalPageFile", ctypes.c_ulonglong),
-                    ("ullAvailPageFile", ctypes.c_ulonglong),
-                    ("ullTotalVirtual", ctypes.c_ulonglong),
-                    ("ullAvailVirtual", ctypes.c_ulonglong),
-                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
-                ]
+    def get_hardware_profile(self, *, force: bool = False) -> dict[str, Any]:
+        """Retourne le profil matériel mis en cache (GPU, RAM, Pagefile/Swap, AVX2, Admin, Proton, warnings)."""
+        import time as _time
 
-            ms = MEMORYSTATUSEX()
-            ms.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
-            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms)):
-                gb = 1024.0 ** 3
-                total_ram = round(ms.ullTotalPhys / gb, 1)
-                free_ram = round(ms.ullAvailPhys / gb, 1)
-                total_commit = round(ms.ullTotalPageFile / gb, 1)
-                free_commit = round(ms.ullAvailPageFile / gb, 1)
-                return {
-                    "total_ram_gb": total_ram,
-                    "free_ram_gb": free_ram,
-                    "total_commit_gb": total_commit,
-                    "free_commit_gb": free_commit,
-                    "used_pct": int(ms.dwMemoryLoad),
-                    "low_memory": free_ram < 5.0 or free_commit < 8.0,
-                }
-        except Exception:
-            pass
-        return {"total_ram_gb": 0.0, "free_ram_gb": 0.0, "total_commit_gb": 0.0, "free_commit_gb": 0.0, "used_pct": 0, "low_memory": False}
+        now_ts = _time.monotonic()
+        if not force and self._hw_profile_cache is not None and (now_ts - self._hw_profile_ts) < 300.0:
+            return dict(self._hw_profile_cache)
+        prof = detect_hardware_profile()
+        self._hw_profile_cache = prof
+        self._hw_profile_ts = now_ts
+        return dict(prof)
 
     @classmethod
     def _load_launcher_settings(cls) -> dict[str, Any]:
         default_game_dir = cls._discover_default_game_dir()
+        default_dl_dir = cls._default_downloads_dir()
+        portable_detected = cls._portable_flag_path().exists()
         defaults: dict[str, Any] = {
             "fps_limit": "60",
             "resolution": "1920x1080",
@@ -301,13 +457,37 @@ class TrackerController:
             "show_logs": True,
             "gpu_profile": "NVIDIA",
             "install_dir": default_game_dir,
+            "downloads_dir": str(default_dl_dir),
             "runtimes_dir": "",
             "launch_in_sandboxie": False,
             "selected_runtime": "cool_fox (Direct)",
             "vanilla_mode": False,
             "auto_download_enabled": True,
-            "auto_download_drive": "D",
+            "auto_download_drive": cls._drive_label_for_path(default_dl_dir),
             "check_updates_on_startup": True,
+            "pinned_roles": {},
+            "auto_backup_on_launch": False,
+            "save_backup_retention": 10,
+            "save_sync_dir": "",
+            "auto_sync_saves": False,
+            "portable_mode": portable_detected,
+            "enforce_provenance": False,
+            "quickstart_completed": False,
+            "trusted_github_owners": [],
+            "presets_remote_url": "",
+            "dump_manifest_path": "",
+            "dump_manifest_url": "",
+            "active_profile": "default",
+            "last_good_runtime": "",
+            "offline_mode": False,
+            "opt_high_perf_power": False,
+            "opt_high_perf_gpu": True,
+            "opt_cpu_priority": "normal",
+            "opt_cpu_affinity": "auto",
+            "opt_trim_memory": True,
+            "low_ram_mode": "auto",
+            "dlss_mode": "auto",
+            "fg_type": "auto",
         }
         if LAUNCHER_SETTINGS_PATH.exists():
             try:
@@ -316,9 +496,36 @@ class TrackerController:
                     defaults.update(saved)
             except Exception:
                 pass
+        if portable_detected:
+            defaults["portable_mode"] = True
+        if not str(defaults.get("downloads_dir") or "").strip():
+            defaults["downloads_dir"] = str(default_dl_dir)
+        else:
+            defaults["downloads_dir"] = str(cls._resolve_portable_path(defaults["downloads_dir"], default_dl_dir))
+        if str(defaults.get("install_dir") or "").strip():
+            defaults["install_dir"] = str(cls._resolve_portable_path(defaults["install_dir"], Path(default_game_dir)))
+        if str(defaults.get("runtimes_dir") or "").strip():
+            defaults["runtimes_dir"] = str(cls._resolve_portable_path(defaults["runtimes_dir"], BASE_DIR / "runtimes"))
+        if str(defaults.get("save_sync_dir") or "").strip():
+            defaults["save_sync_dir"] = str(cls._resolve_portable_path(defaults["save_sync_dir"], BASE_DIR / "save_sync"))
+        if not isinstance(defaults.get("pinned_roles"), dict):
+            defaults["pinned_roles"] = {}
+        if not isinstance(defaults.get("trusted_github_owners"), list):
+            defaults["trusted_github_owners"] = []
         return defaults
 
     def update_launcher_settings(self, patch: dict[str, Any]) -> dict[str, Any]:
+        dl_changed = False
+        new_dl_path: Path | None = None
+        if "downloads_dir" in patch:
+            raw_dl = patch.get("downloads_dir")
+            candidate = self._normalize_downloads_dir(raw_dl)
+            try:
+                candidate.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                return {"ok": False, "error": f"Invalid or unwritable download directory '{candidate}': {exc}"}
+            new_dl_path = candidate
+
         with self._lock:
             for k in (
                 "fps_limit",
@@ -329,6 +536,7 @@ class TrackerController:
                 "show_logs",
                 "gpu_profile",
                 "install_dir",
+                "downloads_dir",
                 "runtimes_dir",
                 "launch_in_sandboxie",
                 "selected_runtime",
@@ -336,27 +544,99 @@ class TrackerController:
                 "auto_download_enabled",
                 "auto_download_drive",
                 "check_updates_on_startup",
+                "pinned_roles",
+                "auto_backup_on_launch",
+                "save_backup_retention",
+                "save_sync_dir",
+                "auto_sync_saves",
+                "portable_mode",
+                "enforce_provenance",
+                "quickstart_completed",
+                "trusted_github_owners",
+                "presets_remote_url",
+                "dump_manifest_path",
+                "dump_manifest_url",
+                "active_profile",
+                "last_good_runtime",
+                "offline_mode",
+                "opt_high_perf_power",
+                "opt_high_perf_gpu",
+                "opt_cpu_priority",
+                "opt_cpu_affinity",
+                "opt_trim_memory",
+                "low_ram_mode",
+                "dlss_mode",
+                "fg_type",
             ):
                 if k in patch and patch[k] is not None:
                     self.settings[k] = patch[k]
+            if new_dl_path is not None:
+                dl_changed = str(new_dl_path) != str(self.downloads_dir)
+                self.downloads_dir = new_dl_path
+                self.settings["downloads_dir"] = str(new_dl_path)
+                self.auto_download_drive = self._drive_label_for_path(new_dl_path)
+                self.settings["auto_download_drive"] = self.auto_download_drive
+            elif "auto_download_drive" in patch and patch["auto_download_drive"]:
+                # Legacy drive-letter update: map to that drive's GTA6_Sandbox_Downloads if valid on Windows
+                drv_target = self._resolve_drive_target(str(patch["auto_download_drive"]))
+                if drv_target is not None:
+                    dl_changed = str(drv_target) != str(self.downloads_dir)
+                    self.downloads_dir = drv_target
+                    self.settings["downloads_dir"] = str(drv_target)
+                    self.auto_download_drive = self._drive_label_for_path(drv_target)
+                    self.settings["auto_download_drive"] = self.auto_download_drive
+            try:
+                ret = int(self.settings.get("save_backup_retention") or 10)
+            except (TypeError, ValueError):
+                ret = 10
+            self.settings["save_backup_retention"] = max(1, min(100, ret))
             self.gpu_profile = str(self.settings.get("gpu_profile") or "NVIDIA").upper()
             self.auto_download_enabled = bool(self.settings.get("auto_download_enabled", True))
-            self.auto_download_drive = str(self.settings.get("auto_download_drive") or "D").strip().rstrip(":\\/").upper()
+            to_persist = dict(self.settings)
+            if self.is_portable_mode():
+                for pk in ("install_dir", "downloads_dir", "runtimes_dir", "save_sync_dir"):
+                    if to_persist.get(pk):
+                        to_persist[pk] = self._serialize_portable_path(to_persist[pk])
             try:
                 LAUNCHER_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
                 LAUNCHER_SETTINGS_PATH.write_text(
-                    json.dumps(self.settings, indent=2, ensure_ascii=False), encoding="utf-8"
+                    json.dumps(to_persist, indent=2, ensure_ascii=False), encoding="utf-8"
                 )
             except OSError:
                 pass
-        self._add_auto_log(
-            f"⚙️ Settings saved (GPU: {self.gpu_profile}, FPS: {self.settings['fps_limit']}, "
-            f"Res: {self.settings.get('resolution')}, Scale: {self.settings.get('render_scale')})"
-        )
-        return {"ok": True, "settings": dict(self.settings)}
+            if hasattr(self, "profiles"):
+                try:
+                    self.profiles.save_profile_settings(self.active_profile, self.settings)
+                except Exception:
+                    pass
+        if dl_changed:
+            self.mods.set_mods_dir(self.downloads_dir / "Mods")
+            try:
+                self.storage.sync_quarantine_folders([self.downloads_dir])
+            except Exception:
+                pass
+            self._add_auto_log(f"📁 Downloads directory updated: {self.downloads_dir}")
+        else:
+            self._add_auto_log(
+                f"⚙️ Settings saved (GPU: {self.gpu_profile}, FPS: {self.settings['fps_limit']}, "
+                f"Res: {self.settings.get('resolution')}, Scale: {self.settings.get('render_scale')})"
+            )
+        if "vanilla_mode" in patch or "install_dir" in patch or dl_changed:
+            try:
+                self.mods.link_mods_to_game(
+                    self._active_game_dir(),
+                    self._mod_stage_dir(),
+                    vanilla=bool(self.settings.get("vanilla_mode", False)),
+                )
+            except Exception:
+                pass
+        return {"ok": True, "settings": dict(self.settings), "downloads_dir": str(self.downloads_dir)}
 
     def _find_runtime_exe(self, rel_candidates: tuple[str, ...]) -> Path:
-        roots = self._discover_runtime_roots(str(self.settings.get("runtimes_dir") or ""))
+        roots = self._discover_runtime_roots(
+            str(self.settings.get("runtimes_dir") or ""),
+            downloads_dir=self.downloads_dir,
+        )
         for root in roots:
             for rel in rel_candidates:
                 cand = root / rel
@@ -448,10 +728,35 @@ class TrackerController:
         return lab_specs
 
     def _get_direct_runtime_specs(self) -> list[dict[str, Any]]:
-        """Liste des runtimes compilés lançables directement depuis le Launcher (détection portable, sans chemins codés en dur)."""
-        local_app = self._local_appdata()
-        shared_save = str(local_app / "6ixpack" / "save")
+        """Lists compiled direct runtimes detectable on disk (portable detection, profile-isolated saves)."""
+        local_app = self._runtime_appdata_root()
+        shared_save = str(self._saves_dir())
+        superbuild_home = local_app / "6ixpack" / "superbuild-vi"
         base_specs = [
+            {
+                "id": "superbuild-vi",
+                "label": "Superbuild-VI (Direct)",
+                "aliases": ("superbuild-vi", "superbuild", "redsyl"),
+                "exe": self._find_runtime_exe(
+                    (
+                        "superbuild-vi/target/release/victory.exe",
+                        "superbuild-vi/target/x86_64-pc-windows-msvc/release/victory.exe",
+                        "superbuild-vi/target/x86_64-pc-windows-gnu/release/victory.exe",
+                        "superbuild-vi/victory.exe",
+                    )
+                ),
+                "mode": "exe",
+                "cli_style": "play",
+                "supports_low_ram": True,
+                "victory_home": str(superbuild_home),
+                "extra_args": [],
+                "prewarm_mode": "superbuild",
+                "env": {
+                    "VICTORY_HOME": str(superbuild_home),
+                    "VICTORY_CACHE_DIR": str(superbuild_home / "cache"),
+                    "VICTORY_DATA_DIR": shared_save,
+                },
+            },
             {
                 "id": "cool_fox",
                 "label": "cool_fox (Direct)",
@@ -609,17 +914,27 @@ class TrackerController:
         return [*base_specs, *self._discover_lab_runtimes()]
 
     def _inspect_dump_status(self) -> dict[str, Any]:
-        """Inspects the configured local dump directory without distributing or hardcoding game files."""
+        """Inspects the configured local dump directory via MicrosoftGame.Config or known dump executables."""
         raw = str(self.settings.get("install_dir") or "").strip()
         if not raw:
-            return {"ready": False, "exists": False, "has_exe": False, "rpf_count": 0, "path": ""}
+            return {
+                "ready": False,
+                "exists": False,
+                "has_exe": False,
+                "rpf_count": 0,
+                "path": "",
+                "exe_path": "",
+                "source": "",
+            }
         p = Path(raw)
-        exists = p.is_dir()
-        has_exe = exists and (p / "game_scarlett_master.exe").is_file()
+        exists = p.is_dir() or p.is_file()
+        resolved = resolve_gdk_title_exe(p, allow_fallback=False) if exists else None
+        has_exe = resolved is not None
+        folder = Path(resolved["folder"]) if resolved else (p if p.is_dir() else p.parent)
         rpf_count = 0
-        if exists:
+        if folder.is_dir():
             try:
-                rpf_count = sum(1 for f in p.iterdir() if f.is_file() and f.suffix.lower() == ".rpf")
+                rpf_count = sum(1 for f in folder.iterdir() if f.is_file() and f.suffix.lower() == ".rpf")
             except OSError:
                 rpf_count = 0
         return {
@@ -627,7 +942,9 @@ class TrackerController:
             "exists": exists,
             "has_exe": has_exe,
             "rpf_count": rpf_count,
-            "path": str(p),
+            "path": str(folder),
+            "exe_path": resolved["exe"] if resolved else "",
+            "source": resolved["source"] if resolved else "",
         }
 
     def _resolve_direct_runtime(self, selected_name: str, *, strict: bool = False) -> dict[str, Any] | None:
@@ -645,21 +962,21 @@ class TrackerController:
                 return s
         return None if strict else specs[0]
 
-    def play_game(self) -> dict[str, Any]:
-        """Lance directement le runtime compilé sélectionné sur le répertoire du jeu (sans Neonbridge UI ni Sandboxie par défaut)."""
+    def play_game(self, *, safe_mode: bool = False) -> dict[str, Any]:
+        """Launches the selected compiled runtime (or Safe Mode recovery profile) against the local dump directory."""
         import time as _time
 
         if self._game_proc is not None and self._game_proc.poll() is None:
             return {"ok": False, "error": f"{self._game_runtime} is already running (PID {self._game_proc.pid})."}
 
         rt_name = str(self.settings.get("selected_runtime") or "cool_fox (Direct)")
-        use_sb = bool(self.settings.get("launch_in_sandboxie", False))
-        vanilla = bool(self.settings.get("vanilla_mode", False))
-        fps = str(self.settings.get("fps_limit") or "60")
-        resolution = str(self.settings.get("resolution") or "1920x1080")
-        render_scale = str(self.settings.get("render_scale") or "1.0")
-        console_prof = str(self.settings.get("console_profile") or "auto").strip().lower()
-        ray_tracing = bool(self.settings.get("ray_tracing", False))
+        use_sb = False if safe_mode else bool(self.settings.get("launch_in_sandboxie", False))
+        vanilla = True if safe_mode else bool(self.settings.get("vanilla_mode", False))
+        fps = "30" if safe_mode else str(self.settings.get("fps_limit") or "60")
+        resolution = "1280x720" if safe_mode else str(self.settings.get("resolution") or "1920x1080")
+        render_scale = "0.75" if safe_mode else str(self.settings.get("render_scale") or "1.0")
+        console_prof = "series-s" if safe_mode else str(self.settings.get("console_profile") or "auto").strip().lower()
+        ray_tracing = False if safe_mode else bool(self.settings.get("ray_tracing", False))
         game_dir = Path(str(self.settings.get("install_dir") or self._discover_default_game_dir()))
 
         if not game_dir.exists():
@@ -667,63 +984,105 @@ class TrackerController:
             self._add_auto_log(f"❌ {msg}")
             return {"ok": False, "error": msg}
 
-        game_exe = game_dir / "game_scarlett_master.exe"
-        if not game_exe.exists():
-            alt_exe = next(
-                (Path(d.root) / "GTA6_Dump" / "game_scarlett_master.exe" for d in list_local_drives() if (Path(d.root) / "GTA6_Dump" / "game_scarlett_master.exe").exists()),
-                None,
-            )
-            if alt_exe is not None:
-                game_exe = alt_exe
-            else:
-                msg = f"game_scarlett_master.exe not found in {game_dir}"
-                self._add_auto_log(f"❌ {msg}")
-                return {"ok": False, "error": msg}
-
-        spec = self._resolve_direct_runtime(rt_name, strict=True)
-        if spec is None:
-            any_spec = self._resolve_direct_runtime(rt_name, strict=False)
-            if any_spec is not None and rt_name:
-                msg = (
-                    f"'{rt_name}' is tracked only and not compiled locally. "
-                    f"Select an 'Installed & Ready (Direct)' runtime in the dropdown (e.g. {any_spec['label']})."
-                )
-            else:
-                msg = "No compiled direct runtime (victory.exe / xcl.exe) found on disk."
+        title_info = resolve_gdk_title_exe(game_dir, allow_fallback=True)
+        if title_info is None:
+            for d in list_local_drives():
+                alt_dir = Path(d.root) / "GTA6_Dump"
+                alt_info = resolve_gdk_title_exe(alt_dir, allow_fallback=False)
+                if alt_info is not None:
+                    title_info = alt_info
+                    break
+        if title_info is None:
+            msg = f"No MicrosoftGame.Config or game executable (game_scarlett_master.exe) found in {game_dir}"
             self._add_auto_log(f"❌ {msg}")
             return {"ok": False, "error": msg}
 
+        game_dir = Path(title_info["folder"])
+        game_exe = Path(title_info["exe"])
+
+        if safe_mode:
+            last_good = str(self.settings.get("last_good_runtime") or "").strip()
+            spec = (
+                self._resolve_direct_runtime(last_good, strict=True)
+                if last_good
+                else None
+            ) or self._resolve_direct_runtime(rt_name, strict=False)
+            if spec is None:
+                msg = "Safe Mode failed: no compiled direct runtime (victory.exe / xcl.exe) found on disk."
+                self._add_auto_log(f"❌ {msg}")
+                return {"ok": False, "error": msg}
+        else:
+            spec = self._resolve_direct_runtime(rt_name, strict=True)
+            if spec is None:
+                any_spec = self._resolve_direct_runtime(rt_name, strict=False)
+                if any_spec is not None and rt_name:
+                    msg = (
+                        f"'{rt_name}' is tracked only and not compiled locally. "
+                        f"Select an 'Installed & Ready (Direct)' runtime in the dropdown (e.g. {any_spec['label']})."
+                    )
+                else:
+                    msg = "No compiled direct runtime (victory.exe / xcl.exe) found on disk."
+                self._add_auto_log(f"❌ {msg}")
+                return {"ok": False, "error": msg}
+
+        hw = self.get_hardware_profile()
         rt_exe = Path(spec["exe"])
-        target_arg = str(game_dir) if spec["mode"] == "dir" else str(game_exe)
-        extra_args = list(spec["extra_args"])
-        if console_prof in {"series-x", "series-s"} and spec["id"] != "xcl":
-            if "--console" in extra_args:
-                idx = extra_args.index("--console")
-                if idx + 1 < len(extra_args):
-                    extra_args[idx + 1] = console_prof
-            else:
-                extra_args.extend(["--console", console_prof])
-        cmd = [str(rt_exe), "run", target_arg, *extra_args]
+        is_superbuild = spec.get("cli_style") == "play"
+        low_ram_mode = "ultralow" if safe_mode else str(self.settings.get("low_ram_mode") or "auto")
+        dlss_mode = "off" if safe_mode else str(self.settings.get("dlss_mode") or "auto")
+        fg_type = "off" if safe_mode else str(self.settings.get("fg_type") or "auto")
 
-        show_logs = bool(self.settings.get("show_logs", False))
-        env = os.environ.copy()
-        env["VICTORY_GAME_DIR"] = str(game_dir)
-        for k, v in spec["env"].items():
-            env[k] = v
-            if k.endswith("_CACHE_DIR") or k.endswith("_DATA_DIR"):
+        if is_superbuild:
+            play_args = build_superbuild_play_args(
+                str(game_exe),
+                vendor=str(hw.get("gpu_vendor") or "unknown"),
+                older_rtx=bool(hw.get("older_rtx", False)),
+                ram_gb=float(hw.get("ram_gb") or 0.0),
+                console_profile=console_prof,
+                low_ram_mode=low_ram_mode,
+                dlss_mode=dlss_mode,
+                fg_type=fg_type,
+                fps_limit=fps,
+            )
+            cmd = [str(rt_exe), *play_args]
+        else:
+            play_args = None
+            target_arg = str(game_dir) if spec["mode"] == "dir" else str(game_exe)
+            extra_args = list(spec["extra_args"])
+            if console_prof in {"series-x", "series-s"} and spec["id"] != "xcl":
+                if "--console" in extra_args:
+                    idx = extra_args.index("--console")
+                    if idx + 1 < len(extra_args):
+                        extra_args[idx + 1] = console_prof
+                else:
+                    extra_args.extend(["--console", console_prof])
+            cmd = [str(rt_exe), "run", target_arg, *extra_args]
+
+        show_logs = True if safe_mode else bool(self.settings.get("show_logs", False))
+        victory_home = Path(spec["victory_home"]) if spec.get("victory_home") else None
+        env = build_shared_profile_env(
+            dict(os.environ),
+            spec_env=dict(spec["env"]),
+            game_dir=game_dir,
+            victory_home=victory_home,
+            resolution=resolution,
+            render_scale=render_scale,
+            ray_tracing=ray_tracing,
+            fps_limit=fps,
+            ram_gb=float(hw.get("ram_gb") or 0.0),
+            console_profile=console_prof,
+            low_ram_mode=low_ram_mode,
+            is_superbuild=is_superbuild,
+            play_args=play_args,
+            runtime_id=str(spec["id"]),
+        )
+        env["SIXDECK_PROFILE"] = self.active_profile
+        if safe_mode:
+            env["SIXDECK_SAFE_MODE"] = "1"
+        for k, v in env.items():
+            if k in {"VICTORY_HOME", "VICTORY_CACHE_DIR", "VICTORY_DATA_DIR"} and v:
                 Path(v).mkdir(parents=True, exist_ok=True)
-        if resolution and "x" in resolution:
-            env["VICTORY_OUTPUT"] = resolution
-            env["VICTORY_DISPLAY_MODE"] = resolution
-        if render_scale and render_scale != "1.0":
-            env["VICTORY_RENDER_SCALE"] = render_scale
-        env["VICTORY_RAYTRACING"] = "1" if ray_tracing else "0"
-        if fps.isdigit():
-            env["VICTORY_FPS_LIMIT"] = fps
-            if spec["id"] == "cool_fox" and int(fps) > 0:
-                env["VICTORY_FRAME_INTERVAL_MS"] = f"{1000.0 / int(fps):.3f}"
 
-        # Activer ou réduire les logs du jeu selon le paramètre "Show Logs" du launcher
         if show_logs:
             env["RUST_LOG"] = "info"
             env["VICTORY_LOG"] = "info"
@@ -732,6 +1091,71 @@ class TrackerController:
             env["RUST_LOG"] = "error"
             env["VICTORY_LOG"] = "error"
             env.pop("RUST_BACKTRACE", None)
+
+        # Surface pre-launch warnings in launcher log
+        if hw.get("is_admin"):
+            self._add_auto_log("⚠️ Running as Administrator/Root: NVIDIA isolates elevated shader caches — reopen normally to reuse caches.")
+        if hw.get("low_pagefile"):
+            self._add_auto_log(f"⚠️ Low virtual memory ({hw.get('pagefile_gb')} GB pagefile/swap on {hw.get('ram_gb')} GB RAM; 16+ GB recommended).")
+
+        # Register high-performance GPU preference on multi-GPU Windows systems
+        if bool(self.settings.get("opt_high_perf_gpu", True)) and hw.get("multi_gpu"):
+            if set_windows_gpu_preference(rt_exe, multi_gpu=True):
+                self._add_auto_log(f"🎮 Registered High-Performance GPU preference for {rt_exe.name}.")
+
+        # Linux / Steam Deck Proton / umu-run / Wine wrapping when running a Windows .exe runtime
+        linux_compat_kind = "native"
+        if os.name != "nt" and str(rt_exe).lower().endswith(".exe"):
+            compat_home = victory_home or (self._runtime_appdata_root() / "6ixpack" / spec["id"])
+            cmd, env, linux_compat_kind = wrap_command_for_linux_compat(
+                cmd,
+                env,
+                compat_runner=hw.get("proton_runner"),
+                compat_home=compat_home,
+            )
+            if linux_compat_kind == "missing_proton":
+                self._add_auto_log(
+                    "⚠️ No Proton / umu-run / Wine detected — attempting direct execution (install umu-run, Steam Proton, or Wine on Linux)."
+                )
+            elif linux_compat_kind != "native":
+                self._add_auto_log(f"🐧 Linux compatibility bridge: launching via {linux_compat_kind} (NVAPI + VKD3D DXR11).")
+
+        # 1. Pre-launch auto-backup (if enabled in Settings)
+        if bool(self.settings.get("auto_backup_on_launch", False)):
+            try:
+                bk = self.backup_saves()
+                if bk.get("ok"):
+                    self._add_auto_log(f"💾 Pre-launch auto-backup created: {bk.get('backup')}")
+            except Exception as exc:
+                self._add_auto_log(f"⚠️ Pre-launch backup skipped: {exc}")
+
+        # 2. Non-destructive mod staging & game directory linking (instant cleanup in Vanilla / Safe Mode)
+        mod_stage_dir = self._mod_stage_dir()
+        mod_deploy = self.mods.link_mods_to_game(game_dir, mod_stage_dir, vanilla=vanilla)
+        if mod_deploy.get("conflicts"):
+            self._add_auto_log(
+                f"⚠️ {len(mod_deploy['conflicts'])} mod .rpf/file conflict(s) detected — load order priority applied."
+            )
+        if not vanilla and mod_deploy.get("deployed_files", 0) > 0:
+            env["SIXDECK_MOD_STAGE_DIR"] = str(mod_stage_dir)
+            env["VICTORY_MODS_DIR"] = str(mod_deploy.get("game_link_path") or mod_stage_dir)
+        else:
+            env.pop("SIXDECK_MOD_STAGE_DIR", None)
+            env.pop("VICTORY_MODS_DIR", None)
+
+        # 3. Opt-in pre-launch system optimization (High Performance power plan & memory trim)
+        sys_mem = self._get_system_memory()
+        opt_ctx = prepare_system_for_launch(
+            high_perf_power=bool(self.settings.get("opt_high_perf_power", False)),
+            trim_memory=bool(self.settings.get("opt_trim_memory", True)),
+            low_memory=bool(sys_mem.get("low_memory", False)),
+        )
+        if opt_ctx.get("power_switched"):
+            self._add_auto_log("⚡ Switched Windows power plan to High Performance (will restore on exit).")
+        elif opt_ctx.get("power_skipped_battery"):
+            self._add_auto_log("🔋 On battery power — skipped High Performance power plan switch.")
+        if opt_ctx.get("memory_trimmed"):
+            self._add_auto_log("🧹 Trimmed launcher memory before runtime launch.")
 
         if use_sb:
             sbie_start = Path(r"C:\Program Files\Sandboxie-Plus\Start.exe")
@@ -742,11 +1166,12 @@ class TrackerController:
         log_path = self._game_log_path
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_fh = open(log_path, "w", encoding="utf-8", errors="replace")
-        log_fh.write(f"=== Direct Launch: {spec['label']} (Game Logs: {'ON' if show_logs else 'ERRORS ONLY'}) ===\n")
+        launch_kind = "SAFE MODE LAUNCH" if safe_mode else "Direct Launch"
+        log_fh.write(f"=== {launch_kind}: {spec['label']} (Profile: {self.active_profile}, Game Logs: {'ON' if show_logs else 'ERRORS ONLY'}) ===\n")
         log_fh.write(f"CMD: {' '.join(cmd)}\n")
         log_fh.write(f"CWD: {run_cwd}\n")
         log_fh.write(f"VICTORY_GAME_DIR: {game_dir}\n")
-        log_fh.write(f"VICTORY_OWN_UPSCALER: {env.get('VICTORY_OWN_UPSCALER', 'unset')}\n")
+        log_fh.write(f"VICTORY_OUTPUT: {env.get('VICTORY_OUTPUT', 'unset')} | SCALE: {env.get('VICTORY_RENDER_SCALE', '1.0')}\n")
         log_fh.write(f"VICTORY_RAYTRACING: {env.get('VICTORY_RAYTRACING', 'unset')}\n")
         log_fh.write(f"RUST_LOG: {env.get('RUST_LOG', '')}\n\n")
         log_fh.flush()
@@ -765,42 +1190,92 @@ class TrackerController:
             self._game_runtime = spec["label"]
         except OSError as exc:
             log_fh.close()
-            self._add_auto_log(f"❌ Failed to start {spec['label']}: {exc}")
-            return {"ok": False, "error": str(exc)}
+            restore_system_after_launch(opt_ctx)
+            hint_extra = (
+                " (Install umu-run, Steam Proton, or Wine to run Windows .exe runtimes on Linux.)"
+                if linux_compat_kind == "missing_proton"
+                else ""
+            )
+            self._add_auto_log(f"❌ Failed to start {spec['label']}: {exc}{hint_extra}")
+            return {"ok": False, "error": f"{exc}{hint_extra}"}
 
-        # Surveiller la fin du processus en arrière-plan et reporter le code de sortie dans les logs
-        def _watch_proc(p: subprocess.Popen[Any], fh: Any, label: str, lp: Path) -> None:
+        # 4. Apply opt-in runtime CPU priority & hybrid P-Core / AMD X3D CCD0 affinity
+        proc_tuning = apply_runtime_process_tuning(
+            proc.pid,
+            priority=str(self.settings.get("opt_cpu_priority") or "normal"),
+            affinity_mode=str(self.settings.get("opt_cpu_affinity") or "auto"),
+        )
+        if proc_tuning.get("priority_applied") or proc_tuning.get("affinity_applied"):
+            self._add_auto_log(
+                f"⚡ Process tuning applied (priority={proc_tuning['priority']}, affinity={proc_tuning['affinity_mode']})."
+            )
+
+        runtime_data_dir = Path(env["VICTORY_HOME"]) if env.get("VICTORY_HOME") else (
+            Path(env["VICTORY_DATA_DIR"]) if env.get("VICTORY_DATA_DIR") else None
+        )
+
+        # Monitor process exit in background, record compatibility & restore power plan
+        def _watch_proc(
+            p: subprocess.Popen[Any],
+            fh: Any,
+            label: str,
+            rt_id: str,
+            lp: Path,
+            power_ctx: dict[str, Any],
+            rt_data_dir: Path | None,
+        ) -> None:
             try:
                 rc = p.wait()
                 fh.flush()
                 fh.close()
+                snap = self._read_game_log_tail(include_lines=False)
+                seen_fps = int(round(snap.get("live_fps") or 0))
                 if rc != 0:
                     if self._game_stop_requested:
                         self._add_auto_log(f"⏹ {label} stopped by user (PID {p.pid}).")
+                        st_lbl = "Perfect" if seen_fps >= 55 else ("Playable" if seen_fps >= 20 else ("In-Game" if seen_fps > 0 else "Menus"))
+                        self.storage.record_runtime_compat(rt_id, st_lbl, fps=seen_fps, crashed=False)
                     else:
-                        self._record_crash(label, rc, lp, p.pid)
+                        self._record_crash(label, rc, lp, p.pid, runtime_data_dir=rt_data_dir)
+                        decoded = decode_exit_code(rc)
+                        self.storage.record_runtime_compat(rt_id, "Crash", fps=seen_fps, crashed=True, notes=f"Exit {decoded['formatted']}")
                         tail = ""
                         try:
                             lines = [ln.strip() for ln in lp.read_text(encoding="utf-8", errors="replace").splitlines() if ln.strip()]
                             tail = " | ".join(lines[-3:])
                         except OSError:
                             pass
-                        self._add_auto_log(f"❌ {label} crashed with code {rc}: {tail[:260]}")
+                        self._add_auto_log(f"❌ {label} crashed with code {decoded['formatted']}: {tail[:260]}")
                 else:
                     self._add_auto_log(f"⏹ {label} closed cleanly (exit 0).")
+                    st_lbl = "Perfect" if seen_fps >= 55 else ("Playable" if seen_fps >= 20 else ("In-Game" if seen_fps > 0 else "Menus"))
+                    self.storage.record_runtime_compat(rt_id, st_lbl, fps=seen_fps, crashed=False)
+                    if str(self.settings.get("last_good_runtime") or "") != label:
+                        self.update_launcher_settings({"last_good_runtime": label})
+                if bool(self.settings.get("auto_sync_saves", False)) and str(self.settings.get("save_sync_dir") or "").strip():
+                    self.sync_saves_to_cloud()
             except Exception:
                 try:
                     fh.close()
                 except Exception:
                     pass
+            finally:
+                if restore_system_after_launch(power_ctx):
+                    self._add_auto_log("🔋 Restored previous Windows power plan.")
 
-        threading.Thread(target=_watch_proc, args=(proc, log_fh, spec["label"], log_path), daemon=True).start()
+        threading.Thread(
+            target=_watch_proc,
+            args=(proc, log_fh, spec["label"], spec["id"], log_path, opt_ctx, runtime_data_dir),
+            daemon=True,
+        ).start()
 
-        # Vérification rapide (1.2s) pour détecter un crash immédiat au démarrage
+        # Quick 1.2s survival check to detect immediate startup crash
         _time.sleep(1.2)
         rc_now = proc.poll()
         if rc_now is not None and rc_now != 0:
-            self._record_crash(spec["label"], rc_now, log_path, proc.pid)
+            self._record_crash(spec["label"], rc_now, log_path, proc.pid, runtime_data_dir=runtime_data_dir)
+            decoded_now = decode_exit_code(rc_now)
+            self.storage.record_runtime_compat(spec["id"], "Crash", fps=0, crashed=True, notes=f"Immediate exit {decoded_now['formatted']}")
             err_tail = ""
             try:
                 lines = [ln.strip() for ln in log_path.read_text(encoding="utf-8", errors="replace").splitlines() if ln.strip()]
@@ -809,24 +1284,45 @@ class TrackerController:
                 pass
             return {
                 "ok": False,
-                "error": f"{spec['label']} crashed immediately (code {rc_now}). {err_tail}",
+                "error": f"{spec['label']} crashed immediately (code {decoded_now['formatted']}). {err_tail}",
+                "exit_decoded": decoded_now,
                 "log_path": str(log_path),
             }
 
-        mode_txt = "Sandboxie" if use_sb else "Direct"
+        # Runtime survived startup — remember it as last validated runtime for Safe Mode
+        if str(self.settings.get("last_good_runtime") or "") != spec["label"]:
+            self.update_launcher_settings({"last_good_runtime": spec["label"]})
+
+        mode_txt = "Safe Mode" if safe_mode else ("Sandboxie" if use_sb else "Direct")
         self._add_auto_log(
-            f"▶ Launched {spec['label']} ({mode_txt}, PID={proc.pid}, FPS={fps}, Logs={'ON' if show_logs else 'OFF'}{', Vanilla' if vanilla else ''}) -> {game_dir}"
+            f"▶ Launched {spec['label']} ({mode_txt}, profile={self.active_profile}, PID={proc.pid}, "
+            f"Res={resolution}, FPS={fps}, RT={'ON' if ray_tracing else 'OFF'}{', Vanilla' if vanilla else ''}) -> {game_dir}"
         )
         return {
             "ok": True,
             "pid": proc.pid,
             "runtime": spec["label"],
+            "safe_mode": safe_mode,
+            "profile": self.active_profile,
             "log_path": str(log_path),
-            "message": f"Launched {spec['label']} directly (PID {proc.pid})!",
+            "system_optimization": {**opt_ctx, **proc_tuning},
+            "message": (
+                f"Safe Mode launched {spec['label']} (Vanilla, {resolution}, RT OFF, PID {proc.pid})!"
+                if safe_mode
+                else f"Launched {spec['label']} directly (PID {proc.pid})!"
+            ),
         }
 
-    def _record_crash(self, label: str, exit_code: int, log_path: Path, pid: int) -> None:
-        """Captures the last seconds of ANSI-cleaned logs right before an unexpected runtime crash."""
+    def _record_crash(
+        self,
+        label: str,
+        exit_code: int,
+        log_path: Path,
+        pid: int,
+        *,
+        runtime_data_dir: Path | None = None,
+    ) -> None:
+        """Captures ANSI-cleaned logs + NTSTATUS diagnosis + runtime crashes.log right before an unexpected exit."""
         with self._lock:
             if self._last_crash and self._last_crash.get("pid") == pid:
                 return
@@ -844,16 +1340,39 @@ class TrackerController:
         except OSError:
             tail_lines = ["(Unable to read runtime log file)"]
 
-        exit_hex = f"0x{exit_code & 0xFFFFFFFF:08X}" if (exit_code < 0 or exit_code > 255) else str(exit_code)
+        # Also inspect recent runtime crashes.log / *.crash.log inside VICTORY_HOME / data dir (Lumen pattern)
+        extra_crash_blocks: list[str] = []
+        if runtime_data_dir and runtime_data_dir.is_dir():
+            cands: list[Path] = []
+            cl = runtime_data_dir / "crashes.log"
+            if cl.is_file():
+                cands.append(cl)
+            cands.extend(
+                sorted(runtime_data_dir.glob("*.crash.log"), key=lambda p: p.stat().st_mtime, reverse=True)[:1]
+            )
+            for cf in cands:
+                try:
+                    raw_c = cf.read_text(encoding="utf-8", errors="replace")
+                    clines = [ansi_re.sub("", ln).rstrip() for ln in raw_c.splitlines() if ln.strip()][-40:]
+                    if clines:
+                        extra_crash_blocks.append(f"--- {cf.name} (last {len(clines)} lines) ---\n" + "\n".join(clines))
+                except OSError:
+                    pass
+
+        decoded = decode_exit_code(exit_code)
+        exit_hex = decoded["formatted"]
         ts_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         header = (
             f"Runtime: {label}\n"
-            f"Exit Code: {exit_hex} (raw={exit_code})\n"
-            f"Timestamp: {ts_str}\n"
+            f"Exit Code: {decoded['formatted']}\n"
+            + (f"Diagnosis: {decoded['hint']}\n" if decoded["hint"] else "")
+            + f"Timestamp: {ts_str}\n"
             f"Log File: {log_path}\n"
             f"--- Last seconds before crash ({len(tail_lines)} lines) ---\n"
         )
         excerpt = header + ("\n".join(tail_lines) if tail_lines else "(No log output captured before exit)")
+        if extra_crash_blocks:
+            excerpt += "\n\n" + "\n\n".join(extra_crash_blocks)
         with self._lock:
             if self._last_crash and self._last_crash.get("pid") == pid:
                 return
@@ -864,6 +1383,8 @@ class TrackerController:
                 "runtime": label,
                 "exit_code": exit_code,
                 "exit_hex": exit_hex,
+                "exit_name": decoded["name"],
+                "hint": decoded["hint"],
                 "timestamp": ts_str,
                 "log_path": str(log_path),
                 "excerpt": excerpt,
@@ -897,7 +1418,7 @@ class TrackerController:
         return {"ok": True, "message": f"Stopped {label} (PID {pid})."}
 
     def prewarm_shaders(self) -> dict[str, Any]:
-        """Pré-compile / pré-traduit les shaders en arrière-plan pour réduire les freezes et crashs 3D."""
+        """Resumable shader & GPU pipeline precompiler with 100% Play env parity and live progress/ETA."""
         with self._lock:
             if self._prewarm_state == "running":
                 return {"ok": False, "error": "Shader prewarm is already running."}
@@ -905,57 +1426,131 @@ class TrackerController:
         spec = self._resolve_direct_runtime(rt_name)
         if spec is None:
             return {"ok": False, "error": "No compiled direct runtime found."}
-        game_dir = Path(str(self.settings.get("install_dir") or self._discover_default_game_dir()))
+        raw_game_dir = Path(str(self.settings.get("install_dir") or self._discover_default_game_dir()))
+        if not raw_game_dir.exists():
+            return {"ok": False, "error": f"Game directory not found: {raw_game_dir}"}
+        title_info = resolve_gdk_title_exe(raw_game_dir, allow_fallback=True)
+        game_dir = Path(title_info["folder"]) if title_info else raw_game_dir
+        game_exe = title_info["exe"] if title_info else str(game_dir / "game_scarlett_master.exe")
         shaders_rpf = game_dir / "shaders.rpf"
-        if not game_dir.exists():
-            return {"ok": False, "error": f"Game directory not found: {game_dir}"}
 
+        hw = self.get_hardware_profile()
         mode = str(spec.get("prewarm_mode") or "none")
         rt_exe = Path(spec["exe"])
+        is_superbuild = spec.get("cli_style") == "play"
         jobs = str(max(2, min(8, (os.cpu_count() or 4) // 2)))
-        cmds: list[list[str]] = []
-        if mode == "cool_fox":
+
+        low_ram_mode = str(self.settings.get("low_ram_mode") or "auto")
+        console_prof = str(self.settings.get("console_profile") or "auto").strip().lower()
+        resolution = str(self.settings.get("resolution") or "1920x1080")
+        render_scale = str(self.settings.get("render_scale") or "1.0")
+        ray_tracing = bool(self.settings.get("ray_tracing", False))
+        fps = str(self.settings.get("fps_limit") or "60")
+        play_args = (
+            build_superbuild_play_args(
+                game_exe,
+                vendor=str(hw.get("gpu_vendor") or "unknown"),
+                older_rtx=bool(hw.get("older_rtx", False)),
+                ram_gb=float(hw.get("ram_gb") or 0.0),
+                console_profile=console_prof,
+                low_ram_mode=low_ram_mode,
+                dlss_mode=str(self.settings.get("dlss_mode") or "auto"),
+                fg_type=str(self.settings.get("fg_type") or "auto"),
+                fps_limit=fps,
+            )
+            if is_superbuild
+            else None
+        )
+
+        victory_home = Path(spec["victory_home"]) if spec.get("victory_home") else None
+        env = build_shared_profile_env(
+            dict(os.environ),
+            spec_env=dict(spec["env"]),
+            game_dir=game_dir,
+            victory_home=victory_home,
+            resolution=resolution,
+            render_scale=render_scale,
+            ray_tracing=ray_tracing,
+            fps_limit=fps,
+            ram_gb=float(hw.get("ram_gb") or 0.0),
+            console_profile=console_prof,
+            low_ram_mode=low_ram_mode,
+            is_superbuild=is_superbuild,
+            play_args=play_args,
+            runtime_id=str(spec["id"]),
+        )
+        for k, v in env.items():
+            if k in {"VICTORY_HOME", "VICTORY_CACHE_DIR", "VICTORY_DATA_DIR"} and v:
+                Path(v).mkdir(parents=True, exist_ok=True)
+
+        cache_dir = Path(env["VICTORY_CACHE_DIR"]) if env.get("VICTORY_CACHE_DIR") else (BASE_DIR / "data" / "shader_cache")
+        book_file = cache_dir / "pipelines" / "known-pipelines.bin"
+
+        cmds: list[tuple[str, list[str]]] = []
+        if mode == "superbuild":
+            # Prefer native Linux CLI for offline shader translation when available
+            native_bin = rt_exe.parent / "victory"
+            shader_bin = str(native_bin) if (os.name != "nt" and native_bin.is_file()) else str(rt_exe)
+            cmds.append(("Precompiling shaders (shared runtime env)", [shader_bin, "shaders", str(game_dir)]))
+            if book_file.is_file():
+                cmds.append(("Warming GPU pipelines & library", [str(rt_exe), "warm", "--used", "--library"]))
+        elif mode == "cool_fox":
             if shaders_rpf.exists():
-                cmds.append([str(rt_exe), "shaders", str(shaders_rpf)])
-            cmds.append([str(rt_exe), "warm", "--used"])
+                cmds.append(("Precompiling shaders", [str(rt_exe), "shaders", str(shaders_rpf)]))
+            cmds.append(("Warming GPU pipelines", [str(rt_exe), "warm", "--used"]))
         elif mode == "scarlettport":
-            cmds.append([str(rt_exe), "warm", str(game_dir), "--jobs", jobs])
+            cmds.append(("Warming shaders", [str(rt_exe), "warm", str(game_dir), "--jobs", jobs]))
         elif mode == "victory":
-            cmds.append([str(rt_exe), "translate", str(game_dir), "--warm", "all", "--jobs", jobs])
+            cmds.append(("Translating & warming shaders", [str(rt_exe), "translate", str(game_dir), "--warm", "all", "--jobs", jobs]))
         else:
             return {
                 "ok": False,
-                "error": f"{spec['label']} does not expose a shader prewarm command. Switch to cool_fox, ScarlettPort, or VIctory.",
+                "error": f"{spec['label']} does not expose a shader prewarm command. Switch to Superbuild-VI, cool_fox, ScarlettPort, or VIctory.",
             }
 
-        env = os.environ.copy()
-        env["VICTORY_GAME_DIR"] = str(game_dir)
-        for k, v in spec["env"].items():
-            env[k] = v
-            if k.endswith("_CACHE_DIR") or k.endswith("_DATA_DIR"):
-                Path(v).mkdir(parents=True, exist_ok=True)
-        run_cwd = str(rt_exe.parent) if spec.get("use_exe_cwd") else str(game_dir)
+        run_cwd = str(rt_exe.parent) if (spec.get("use_exe_cwd") or is_superbuild) else str(game_dir)
         log_path = BASE_DIR / "data" / "prewarm.log"
+        timings_path = BASE_DIR / "data" / "timings.json"
+        hw_id = str(hw.get("hw_id") or "")
+        hist = load_timing_history(timings_path, hw_id)
+        tracker = ShaderProgressTracker(str(spec["id"]), history=hist)
 
         def _worker() -> None:
             with self._lock:
                 self._prewarm_state = "running"
                 self._prewarm_runtime = spec["label"]
                 self._prewarm_detail = f"Starting shader prewarm ({spec['label']})..."
-            self._add_auto_log(f"🔥 Prewarm shaders started ({spec['label']}, jobs={jobs})...")
+                self._prewarm_progress = tracker.snapshot()
+            self._add_auto_log(f"🔥 Prewarm shaders started ({spec['label']}, cache-key parity ON, jobs={jobs})...")
             try:
                 with open(log_path, "w", encoding="utf-8", errors="replace") as fh:
-                    for step_idx, cmd in enumerate(cmds, 1):
+                    for step_idx, (step_title, raw_cmd) in enumerate(cmds, 1):
                         with self._lock:
                             if self._prewarm_state != "running":
                                 break
-                            self._prewarm_detail = f"Step {step_idx}/{len(cmds)}: {' '.join(cmd[1:3])}..."
-                        fh.write(f"=== Step {step_idx}/{len(cmds)}: {' '.join(cmd)} ===\n")
+                        step_cmd = list(raw_cmd)
+                        step_env = dict(env)
+                        if os.name != "nt" and step_cmd[0].lower().endswith(".exe"):
+                            compat_home = victory_home or (self._runtime_appdata_root() / "6ixpack" / spec["id"])
+                            step_cmd, step_env, kind = wrap_command_for_linux_compat(
+                                step_cmd,
+                                step_env,
+                                compat_runner=hw.get("proton_runner"),
+                                compat_home=compat_home,
+                            )
+                            if kind == "missing_proton":
+                                raise RuntimeError("Proton, umu-run, or Wine is required to run Windows precompile binaries on Linux.")
+                        hdr_line = f"=== {step_title} ==="
+                        tracker.feed_line(hdr_line)
+                        with self._lock:
+                            self._prewarm_progress = tracker.snapshot()
+                            self._prewarm_detail = f"Step {step_idx}/{len(cmds)}: {step_title}..."
+                        fh.write(f"{hdr_line}\nCMD: {' '.join(step_cmd)}\n")
                         fh.flush()
                         p = subprocess.Popen(
-                            cmd,
+                            step_cmd,
                             cwd=run_cwd,
-                            env=env,
+                            env=step_env,
                             stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT,
                             text=True,
@@ -968,23 +1563,32 @@ class TrackerController:
                                 fh.write(ln)
                                 s = ln.strip()
                                 if s:
+                                    tracker.feed_line(s)
+                                    snap = tracker.snapshot()
                                     with self._lock:
-                                        self._prewarm_detail = s[-120:]
+                                        self._prewarm_progress = snap
+                                        eta_part = f" · ETA {snap['eta']}" if snap.get("eta") else ""
+                                        self._prewarm_detail = f"{snap['label']}{eta_part}" if snap.get("count") else s[-120:]
                         rc = p.wait()
                         if rc != 0:
-                            # Sur cool_fox, l'étape 1 (shaders) peut paniquer sur 1 shader isolé après en avoir caché ~25 000 : on poursuit sur warm --used
-                            if mode == "cool_fox" and step_idx < len(cmds):
+                            if mode in {"cool_fox", "superbuild"} and step_idx < len(cmds):
                                 self._add_auto_log(f"⚠️ Prewarm step {step_idx} exited ({rc}) after caching shaders — continuing to step {step_idx + 1}...")
                                 continue
                             with self._lock:
                                 if self._prewarm_state == "running":
                                     self._prewarm_state = "error"
-                                    self._prewarm_detail = f"Exited with code {rc} (see data/prewarm.log)"
-                            self._add_auto_log(f"⚠️ Shader prewarm exited with code {rc}.")
+                                    self._prewarm_detail = f"Exited with code {rc} (resumable; see data/prewarm.log)"
+                            self._add_auto_log(f"⚠️ Shader prewarm exited with code {rc} (progress kept for resume).")
                             return
+                tracker.close_phase()
+                save_timing_history(timings_path, hw_id, str(spec["id"]), tracker.recorded)
                 with self._lock:
                     if self._prewarm_state == "running":
                         self._prewarm_state = "done"
+                        done_snap = tracker.snapshot()
+                        done_snap["percent"] = 100.0
+                        done_snap["eta"] = "ready"
+                        self._prewarm_progress = done_snap
                         self._prewarm_detail = f"Shader cache ready for {spec['label']}!"
                 self._add_auto_log(f"✅ Shader prewarm complete ({spec['label']})!")
             except Exception as exc:
@@ -996,7 +1600,108 @@ class TrackerController:
                 self._prewarm_proc = None
 
         threading.Thread(target=_worker, daemon=True).start()
-        return {"ok": True, "message": f"Shader prewarm started for {spec['label']}!"}
+        return {"ok": True, "message": f"Shader prewarm started for {spec['label']} (resumable, Play env parity)!"}
+
+    def get_upscaler_sdk_state(self) -> dict[str, Any]:
+        """Inspects portable NVIDIA Streamline (DLSS) & AMD FidelityFX (FSR 3) SDK readiness."""
+        hw = self.get_hardware_profile()
+        local_app = self._runtime_appdata_root()
+        data_dir = local_app / "6ixpack" / "superbuild-vi"
+        st = inspect_upscaler_sdk_state(
+            data_dir,
+            vendor=str(hw.get("gpu_vendor") or "unknown"),
+            older_rtx=bool(hw.get("older_rtx", False)),
+            low_ram_mode=str(self.settings.get("low_ram_mode") or "auto"),
+        )
+        agility_dll = BASE_DIR / "data" / "agility" / "x64" / "D3D12Core.dll"
+        st["agility_ready"] = agility_dll.is_file()
+        st["fetching"] = self._sdk_fetch_running
+        return st
+
+    def fetch_upscaler_sdks(self) -> dict[str, Any]:
+        """Fetches NVIDIA DLSS / AMD FSR 3 SDK DLLs into portable runtime data folder via victory.exe get-dlss/get-fsr."""
+        if self.is_offline_mode():
+            return {"ok": False, "offline": True, "error": "Strict Offline Mode is active — disable Offline Mode to fetch SDKs."}
+        if self._sdk_fetch_running:
+            return {"ok": False, "error": "SDK fetch is already running."}
+        spec = self._resolve_direct_runtime("Superbuild-VI (Direct)", strict=True) or self._resolve_direct_runtime(
+            str(self.settings.get("selected_runtime") or ""), strict=False
+        )
+        if spec is None:
+            return {"ok": False, "error": "No compiled Victory / Superbuild-VI runtime found on disk to run get-dlss / get-fsr."}
+
+        hw = self.get_hardware_profile()
+        rt_exe = Path(spec["exe"])
+        data_dir = Path(spec.get("victory_home") or (self._runtime_appdata_root() / "6ixpack" / "superbuild-vi"))
+        data_dir.mkdir(parents=True, exist_ok=True)
+        vendor = str(hw.get("gpu_vendor") or "unknown")
+        older_rtx = bool(hw.get("older_rtx", False))
+        subcmds: list[str] = []
+        if vendor == "nvidia":
+            subcmds.append("get-dlss")
+        if older_rtx or vendor == "amd":
+            subcmds.append("get-fsr")
+        if not subcmds:
+            return {"ok": True, "message": "No DLSS or FSR 3 SDK needed for the detected GPU.", "sdk_state": self.get_upscaler_sdk_state()}
+
+        env = os.environ.copy()
+        env["VICTORY_HOME"] = str(data_dir)
+        self._sdk_fetch_running = True
+        ran: list[str] = []
+        errors: list[str] = []
+        try:
+            for sc in subcmds:
+                cmd = [str(rt_exe), sc]
+                step_env = dict(env)
+                if os.name != "nt" and str(rt_exe).lower().endswith(".exe"):
+                    cmd, step_env, kind = wrap_command_for_linux_compat(
+                        cmd,
+                        step_env,
+                        compat_runner=hw.get("proton_runner"),
+                        compat_home=data_dir,
+                    )
+                    if kind == "missing_proton":
+                        errors.append(f"{sc}: Proton/Wine required on Linux")
+                        continue
+                proc = subprocess.run(
+                    cmd,
+                    cwd=str(rt_exe.parent),
+                    env=step_env,
+                    capture_output=True,
+                    text=True,
+                    timeout=180,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                if proc.returncode == 0:
+                    ran.append(sc)
+                else:
+                    err_tail = ((proc.stderr or proc.stdout or "").strip().splitlines() or [f"exit {proc.returncode}"])[-1]
+                    errors.append(f"{sc}: {err_tail[:140]}")
+        except Exception as exc:
+            errors.append(str(exc))
+        finally:
+            self._sdk_fetch_running = False
+
+        after = self.get_upscaler_sdk_state()
+        if errors:
+            self._add_auto_log(f"⚠️ Upscaler SDK fetch issues: {'; '.join(errors)}")
+            return {"ok": bool(ran), "ran": ran, "errors": errors, "sdk_state": after, "error": "; ".join(errors)}
+        self._add_auto_log(f"✅ Portable upscaler SDKs ready ({', '.join(ran)}) in {data_dir}.")
+        return {"ok": True, "ran": ran, "sdk_state": after, "message": f"Portable SDKs fetched ({', '.join(ran)}) into {data_dir}!"}
+
+    def fetch_d3d12_agility(self) -> dict[str, Any]:
+        """Downloads Microsoft D3D12 Agility SDK (1.620.2 x64) into portable data/agility/x64 and active runtime D3D12/."""
+        if self.is_offline_mode():
+            return {"ok": False, "offline": True, "error": "Strict Offline Mode is active — disable Offline Mode to download D3D12 Agility SDK."}
+        cache_dir = BASE_DIR / "data" / "agility" / "x64"
+        spec = self._resolve_direct_runtime(str(self.settings.get("selected_runtime") or ""), strict=False)
+        dest_dir = (Path(spec["exe"]).parent / "D3D12") if spec is not None else None
+        res = fetch_d3d12_agility_sdk(cache_dir, dest_dir=dest_dir)
+        if res.get("ok"):
+            self._add_auto_log(f"🎮 {res.get('message')}")
+        else:
+            self._add_auto_log(f"❌ D3D12 Agility SDK download failed: {res.get('error')}")
+        return res
 
     def stop_prewarm(self) -> dict[str, Any]:
         proc = self._prewarm_proc
@@ -1012,10 +1717,109 @@ class TrackerController:
         self._add_auto_log("⏹ Shader prewarm cancelled.")
         return {"ok": True, "message": "Shader prewarm cancelled."}
 
+    def is_offline_mode(self) -> bool:
+        return bool(self.settings.get("offline_mode", False))
+
+    def toggle_offline_mode(self, enabled: bool) -> dict[str, Any]:
+        flag = bool(enabled)
+        if flag and self.running:
+            self.stop()
+        res = self.update_launcher_settings({"offline_mode": flag})
+        if res.get("ok"):
+            self._add_auto_log(
+                "✈️ Strict Offline Mode ENABLED — all network requests & scrapers are blocked."
+                if flag
+                else "🌐 Offline Mode DISABLED — online sync & scrapers re-enabled."
+            )
+        return {
+            "ok": bool(res.get("ok")),
+            "offline_mode": self.is_offline_mode(),
+            "message": (
+                "Strict Offline Mode enabled — 100% of network requests disabled."
+                if flag
+                else "Online mode restored."
+            ),
+        }
+
     def _saves_dir(self) -> Path:
-        d = self._local_appdata() / "6ixpack" / "save"
-        d.mkdir(parents=True, exist_ok=True)
-        return d
+        return self.profiles.saves_dir_for(self.active_profile, self._runtime_appdata_root())
+
+    def _mod_stage_dir(self) -> Path:
+        return self.profiles.stage_dir_for(self.active_profile, self.downloads_dir)
+
+    def list_profiles(self) -> dict[str, Any]:
+        info = self.profiles.list_profiles()
+        return {"ok": True, **info}
+
+    def get_profile_cli_command(self, profile_id: str = "") -> dict[str, Any]:
+        pid = (profile_id or self.active_profile or "default").strip()
+        exe_cand = BASE_DIR / "SixDeck.exe"
+        if exe_cand.is_file():
+            cmd = f'"{exe_cand}" --launch "{pid}"'
+        else:
+            cmd = f'"{sys.executable}" "{BASE_DIR / "launcher_app.py"}" --launch "{pid}"'
+        return {"ok": True, "profile_id": pid, "command": cmd}
+
+    def switch_profile(self, identifier: str) -> dict[str, Any]:
+        """Switches active profile/modpack, isolating runtime, graphics settings, mods_state.json, and saves."""
+        with self._lock:
+            self.profiles.save_profile_settings(self.active_profile, self.settings)
+            res = self.profiles.set_active_profile(identifier)
+            if not res.get("ok"):
+                return res
+            prof = res["profile"]
+            pid = str(prof["id"])
+            self.active_profile = pid
+            patch: dict[str, Any] = {"active_profile": pid}
+            prof_settings = prof.get("settings") or {}
+            for k in PROFILE_SETTING_KEYS:
+                if k in prof_settings:
+                    patch[k] = prof_settings[k]
+            self.mods.set_state_path(self.profiles.mods_state_path_for(pid, MODS_STATE_PATH))
+
+        upd = self.update_launcher_settings(patch)
+        if not upd.get("ok"):
+            return upd
+        try:
+            self.mods.link_mods_to_game(
+                self._active_game_dir(),
+                self._mod_stage_dir(),
+                vanilla=bool(self.settings.get("vanilla_mode", False)),
+            )
+        except Exception:
+            pass
+        self._add_auto_log(f"🧩 Switched to profile '{prof['name']}' (saves: {self._saves_dir()})")
+        return {
+            "ok": True,
+            "active_profile": pid,
+            "profile": prof,
+            "saves_dir": str(self._saves_dir()),
+            "message": f"Switched to profile '{prof['name']}'!",
+        }
+
+    def create_profile(self, name: str, *, description: str = "", clone_current: bool = True) -> dict[str, Any]:
+        with self._lock:
+            self.profiles.save_profile_settings(self.active_profile, self.settings)
+            res = self.profiles.create_profile(
+                name,
+                description=description,
+                base_settings=dict(self.settings) if clone_current else {},
+                clone_mods_from=self.mods.state_path if clone_current else None,
+            )
+        if res.get("ok"):
+            self._add_auto_log(f"➕ {res.get('message')}")
+            return self.switch_profile(res["profile"]["id"])
+        return res
+
+    def delete_profile(self, profile_id: str) -> dict[str, Any]:
+        was_active = profile_id == self.active_profile
+        res = self.profiles.delete_profile(profile_id)
+        if not res.get("ok"):
+            return res
+        self._add_auto_log(f"🗑️ {res.get('message')}")
+        if was_active:
+            self.switch_profile("default")
+        return res
 
     def _save_backups_dir(self) -> Path:
         d = BASE_DIR / "data" / "save_backups"
@@ -1029,6 +1833,10 @@ class TrackerController:
             "save_dir": str(self._saves_dir()),
             "backup_count": len(zips),
             "latest_backup": zips[0].name if zips else "",
+            "retention": int(self.settings.get("save_backup_retention") or 10),
+            "auto_backup_on_launch": bool(self.settings.get("auto_backup_on_launch", False)),
+            "save_sync_dir": str(self.settings.get("save_sync_dir") or ""),
+            "auto_sync_saves": bool(self.settings.get("auto_sync_saves", False)),
         }
 
     def backup_saves(self) -> dict[str, Any]:
@@ -1042,12 +1850,86 @@ class TrackerController:
         with zipfile.ZipFile(out_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             for f in files:
                 zf.write(f, arcname=str(f.relative_to(sdir)))
-        # Garder les 10 sauvegardes les plus récentes
+        # Respect configurable retention limit to avoid filling disk
+        retention = max(1, min(100, int(self.settings.get("save_backup_retention") or 10)))
         old_zips = sorted(bdir.glob("save_backup_*.zip"), key=lambda p: p.stat().st_mtime, reverse=True)
-        for stale in old_zips[10:]:
+        for stale in old_zips[retention:]:
             stale.unlink(missing_ok=True)
-        self._add_auto_log(f"💾 Saves backed up: {out_zip.name} ({len(files)} file(s))")
-        return {"ok": True, "message": f"Backup created: {out_zip.name} ({len(files)} files)", "backup": out_zip.name}
+        self._add_auto_log(f"💾 Saves backed up: {out_zip.name} ({len(files)} file(s), retention={retention})")
+        synced_note = ""
+        if bool(self.settings.get("auto_sync_saves", False)) and str(self.settings.get("save_sync_dir") or "").strip():
+            sres = self.sync_saves_to_cloud()
+            if sres.get("ok"):
+                synced_note = f" · synced to {sres.get('sync_dir')}"
+        return {
+            "ok": True,
+            "message": f"Backup created: {out_zip.name} ({len(files)} files){synced_note}",
+            "backup": out_zip.name,
+        }
+
+    def sync_saves_to_cloud(self, target_dir: str = "") -> dict[str, Any]:
+        """Synchronizes active saves & latest backup ZIP into a user-chosen sync folder (Drive/OneDrive/Syncthing/Git)."""
+        raw = (target_dir or str(self.settings.get("save_sync_dir") or "")).strip()
+        if not raw:
+            return {"ok": False, "error": "Configure a Cloud Sync folder first in Settings."}
+        dest_root = self._resolve_portable_path(raw, BASE_DIR / "save_sync")
+        dest_saves = dest_root / "SixDeck_Saves"
+        dest_backups = dest_root / "SixDeck_Backups"
+        try:
+            dest_saves.mkdir(parents=True, exist_ok=True)
+            dest_backups.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return {"ok": False, "error": f"Cannot write to sync folder '{dest_root}': {exc}"}
+
+        sdir = self._saves_dir()
+        copied = 0
+        for fp in sdir.rglob("*"):
+            if not fp.is_file():
+                continue
+            rel = fp.relative_to(sdir)
+            dst = dest_saves / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(fp, dst)
+            copied += 1
+
+        bdir = self._save_backups_dir()
+        zips = sorted(bdir.glob("save_backup_*.zip"), key=lambda p: p.stat().st_mtime, reverse=True)
+        latest_zip_copied = ""
+        if zips:
+            shutil.copy2(zips[0], dest_backups / zips[0].name)
+            latest_zip_copied = zips[0].name
+
+        self._add_auto_log(f"☁️ Saves synced to {dest_root} ({copied} file(s){', ' + latest_zip_copied if latest_zip_copied else ''}).")
+        return {
+            "ok": True,
+            "sync_dir": str(dest_root),
+            "files_synced": copied,
+            "latest_backup": latest_zip_copied,
+            "message": f"Synced {copied} save file(s) to {dest_root}",
+        }
+
+    def pick_save_sync_dir(self) -> dict[str, Any]:
+        """Opens a native folder picker for the Cloud Sync target directory."""
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            initial = str(self.settings.get("save_sync_dir") or BASE_DIR)
+            chosen = filedialog.askdirectory(
+                title="Select Save Cloud Sync Folder (Drive / OneDrive / Syncthing / Git)",
+                initialdir=initial if Path(initial).exists() else str(BASE_DIR),
+            )
+            root.destroy()
+            if chosen:
+                norm = str(Path(chosen))
+                self.update_launcher_settings({"save_sync_dir": norm})
+                return {"ok": True, "save_sync_dir": norm}
+            return {"ok": True, "save_sync_dir": ""}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
 
     def restore_saves(self, filename: str = "") -> dict[str, Any]:
         bdir = self._save_backups_dir()
@@ -1063,8 +1945,7 @@ class TrackerController:
 
     def open_saves_folder(self) -> dict[str, Any]:
         sdir = self._saves_dir()
-        if os.name == "nt":
-            os.startfile(str(sdir))  # type: ignore[attr-defined]
+        _open_folder_in_os(sdir)
         return {"ok": True, "save_dir": str(sdir)}
 
     def _read_game_log_tail(self, max_lines: int = 160, include_lines: bool = True) -> dict[str, Any]:
@@ -1161,17 +2042,256 @@ class TrackerController:
             )
         return {"ok": True, "log_path": str(lp)}
 
+    def _effective_trusted_owners(self) -> list[str]:
+        owners: list[str] = list(DEFAULT_TRUSTED_GITHUB_OWNERS)
+        owners.extend(self.config.sandbox_provenance.trusted_github_owners or [])
+        owners.extend(self.settings.get("trusted_github_owners") or [])
+        seen: set[str] = set()
+        out: list[str] = []
+        for o in owners:
+            s = str(o or "").strip()
+            if s and s.lower() not in seen:
+                seen.add(s.lower())
+                out.append(s)
+        return out
+
+    def trust_github_owner(self, owner: str) -> dict[str, Any]:
+        cleaned = (owner or "").strip()
+        if not cleaned:
+            return {"ok": False, "error": "Owner name is empty."}
+        cur = list(self.settings.get("trusted_github_owners") or [])
+        if cleaned.lower() not in {x.lower() for x in cur}:
+            cur.append(cleaned)
+            self.update_launcher_settings({"trusted_github_owners": cur})
+            self._add_auto_log(f"🛡️ Added '{cleaned}' to trusted GitHub provenance whitelist.")
+        return {"ok": True, "owner": cleaned, "trusted_github_owners": self._effective_trusted_owners()}
+
+    def toggle_pin_role(
+        self,
+        role: str,
+        *,
+        item_id: str = "",
+        title: str = "",
+        version: str = "",
+        pinned: bool | None = None,
+    ) -> dict[str, Any]:
+        """Pins or unpins a specific runtime/component revision so auto-updates cannot overwrite it."""
+        role_key = (role or "").strip()
+        if not role_key:
+            return {"ok": False, "error": "Missing component role."}
+        pinned_map = dict(self.settings.get("pinned_roles") or {})
+        should_pin = (role_key not in pinned_map) if pinned is None else bool(pinned)
+        if should_pin:
+            pinned_map[role_key] = {
+                "item_id": item_id,
+                "title": title or role_key,
+                "version": version or "Current local revision",
+                "pinned_at": datetime.now(timezone.utc).isoformat(),
+            }
+            self._add_auto_log(f"📌 Pinned [{role_key}] at '{version or title or 'current'}' (auto-updates blocked).")
+            msg = f"Pinned {title or role_key} — auto-updates will not overwrite it."
+        else:
+            pinned_map.pop(role_key, None)
+            self._add_auto_log(f"🔓 Unpinned [{role_key}] (auto-updates re-enabled).")
+            msg = f"Unpinned {role_key} — updates enabled again."
+        self.update_launcher_settings({"pinned_roles": pinned_map})
+        return {"ok": True, "role": role_key, "pinned": should_pin, "pinned_roles": pinned_map, "message": msg}
+
+    def start_dump_verification(
+        self,
+        *,
+        algorithm: str = "sha256",
+        manifest_path: str = "",
+        manifest_url: str = "",
+        generate_manifest: bool = False,
+    ) -> dict[str, Any]:
+        """Runs asynchronous streaming checksum verification (SHA-256/MD5/SHA-1/CRC32) on the local dump."""
+        with self._lock:
+            if self._dump_verify_state.get("running"):
+                return {"ok": True, "already_running": True, "state": dict(self._dump_verify_state)}
+            self._dump_verify_cancel.clear()
+            self._dump_verify_state = {
+                "running": True,
+                "progress": {"stage": "starting", "percent": 0.0, "current_file": "", "file_index": 0, "total_files": 0},
+                "report": None,
+                "error": "",
+            }
+
+        game_dir = Path(str(self.settings.get("install_dir") or self._discover_default_game_dir()))
+        m_path_str = (manifest_path or str(self.settings.get("dump_manifest_path") or "")).strip()
+        m_url_str = (manifest_url or str(self.settings.get("dump_manifest_url") or "")).strip()
+
+        def _worker() -> None:
+            def _on_prog(p: dict[str, Any]) -> None:
+                with self._lock:
+                    self._dump_verify_state["progress"] = dict(p)
+
+            try:
+                if generate_manifest:
+                    manifest = build_local_manifest(game_dir, algorithm=algorithm, on_progress=_on_prog)
+                    out_file = game_dir / "dump_manifest.json"
+                    out_file.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+                    rep = verify_dump_directory(
+                        game_dir,
+                        manifest_data=manifest,
+                        manifest_path=out_file,
+                        algorithm=algorithm,
+                        on_progress=_on_prog,
+                        cancel_check=self._dump_verify_cancel.is_set,
+                    )
+                    self._add_auto_log(f"🛡️ Dump reference manifest created & verified: {out_file.name}")
+                else:
+                    manifest_data = None
+                    m_path = Path(m_path_str) if m_path_str else None
+                    if m_url_str.startswith(("http://", "https://")):
+                        if self.is_offline_mode():
+                            raise RuntimeError("Offline Mode is enabled — cannot fetch remote dump manifest URL.")
+                        with httpx.Client(follow_redirects=True, timeout=15.0) as client:
+                            r = client.get(m_url_str, headers={"User-Agent": "SixDeck-DumpVerifier/1.0"})
+                            r.raise_for_status()
+                            manifest_data = r.json()
+                    rep = verify_dump_directory(
+                        game_dir,
+                        manifest_data=manifest_data,
+                        manifest_path=m_path,
+                        algorithm=algorithm,
+                        on_progress=_on_prog,
+                        cancel_check=self._dump_verify_cancel.is_set,
+                    )
+                    self._add_auto_log(f"🔍 Dump checksum check ({rep.algorithm.upper()}): {rep.summary}")
+                with self._lock:
+                    self._dump_verify_state["report"] = rep.to_dict()
+                    self._dump_verify_state["running"] = False
+            except Exception as exc:
+                with self._lock:
+                    self._dump_verify_state["error"] = str(exc)
+                    self._dump_verify_state["running"] = False
+                self._add_auto_log(f"❌ Dump checksum verification failed: {exc}")
+
+        threading.Thread(target=_worker, daemon=True).start()
+        return {"ok": True, "started": True, "algorithm": algorithm}
+
+    def get_dump_verification_status(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "ok": True,
+                "running": bool(self._dump_verify_state.get("running")),
+                "progress": dict(self._dump_verify_state["progress"]) if self._dump_verify_state.get("progress") else None,
+                "report": dict(self._dump_verify_state["report"]) if self._dump_verify_state.get("report") else None,
+                "error": str(self._dump_verify_state.get("error") or ""),
+            }
+
+    def list_presets(self, *, remote_url: str = "") -> dict[str, Any]:
+        extra: list[dict[str, Any]] = []
+        url = (remote_url or str(self.settings.get("presets_remote_url") or "")).strip()
+        if url.startswith(("http://", "https://")) and not self.is_offline_mode():
+            try:
+                extra = asyncio.run(fetch_remote_presets(url))
+            except Exception:
+                extra = []
+        presets = get_presets_for_gpu(self.gpu_profile, extra_presets=extra)
+        return {"ok": True, "gpu_profile": self.gpu_profile, "presets": presets}
+
+    def apply_preset(self, *, preset_id: str = "", raw_payload: str = "") -> dict[str, Any]:
+        try:
+            if raw_payload.strip():
+                preset = parse_preset_input(raw_payload)
+            else:
+                all_p = self.list_presets().get("presets") or []
+                preset = next((p for p in all_p if p.get("id") == preset_id), None)
+                if not preset:
+                    return {"ok": False, "error": f"Preset '{preset_id}' not found."}
+            res = self.update_launcher_settings(preset["settings"])
+            if not res.get("ok"):
+                return res
+            mods_res = {"matched": 0}
+            if preset.get("mods_order"):
+                mods_res = self.mods.apply_mods_order(preset["mods_order"])
+            self._add_auto_log(f"🎛️ Preset applied: {preset['name']} (mods matched: {mods_res.get('matched', 0)})")
+            return {
+                "ok": True,
+                "preset": preset,
+                "mods_matched": mods_res.get("matched", 0),
+                "message": f"Preset '{preset['name']}' applied!",
+            }
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def export_current_preset(self, *, name: str = "", description: str = "") -> dict[str, Any]:
+        mods = self.mods.sync_disk_mods()
+        data = export_preset(
+            self.settings,
+            mods,
+            name=name or f"SixDeck {self.gpu_profile} Preset",
+            description=description,
+        )
+        return {"ok": True, **data}
+
+    def export_to_steam(self, *, steam_config_dir: str = "", artwork_query: str = "SixDeck") -> dict[str, Any]:
+        exe_cand = BASE_DIR / "SixDeck.exe"
+        if not exe_cand.exists():
+            exe_cand = Path(sys.executable)
+        ico = ASSETS_DIR / "launcher_icon.ico"
+        cfg_dir = Path(steam_config_dir) if steam_config_dir.strip() else None
+        res = export_steam_shortcut(
+            app_name="SixDeck",
+            exe_path=exe_cand,
+            start_dir=BASE_DIR,
+            icon_path=ico if ico.exists() else None,
+            steam_config_dir=cfg_dir,
+            steamgriddb_api_key=self.config.steamgriddb_api_key,
+            artwork_query=artwork_query or "SixDeck",
+        )
+        if res.get("ok"):
+            self._add_auto_log(f"🎮 {res.get('message')}")
+        return res
+
+    def create_support_bundle(self) -> dict[str, Any]:
+        """Generates an anonymized Support Bundle ZIP + GitHub Issue Markdown summary."""
+        mods = self.mods.sync_disk_mods()
+        conflicts = self.mods.detect_rpf_conflicts(mods)
+        extra_secrets = [
+            s
+            for s in (
+                self.config.github_token,
+                self.config.virustotal_api_key,
+                self.config.discord_webhook_url,
+                self.config.steamgriddb_api_key,
+            )
+            if s
+        ]
+        res = generate_support_bundle(
+            BASE_DIR / "reports" / "support_bundles",
+            settings=dict(self.settings),
+            system_memory=self._get_system_memory(),
+            mods_installed=mods,
+            mod_conflicts=conflicts,
+            game_log_path=self._game_log_path,
+            launcher_logs=list(self.auto_logs),
+            last_crash=dict(self._last_crash) if self._last_crash else None,
+            runtime_version=str(self.settings.get("selected_runtime") or ""),
+            portable_mode=self.is_portable_mode(),
+            extra_secrets=extra_secrets,
+        )
+        self._add_auto_log(f"🩺 Anonymized Support Bundle created: {res['zip_name']}")
+        return res
+
     def update_all_pillars(self) -> dict[str, Any]:
-        """Met à jour tous les piliers critiques ayant une MàJ disponible (compatible GPU)."""
+        """Met à jour tous les piliers critiques ayant une MàJ disponible (compatible GPU), sauf les rôles épinglés."""
         state = self.get_cockpit_state(gpu=self.gpu_profile)
+        pinned_roles = dict(self.settings.get("pinned_roles") or {})
         updated_names: list[str] = []
+        skipped_pinned: list[str] = []
         for pil in state.get("pillars") or []:
             best = pil.get("best")
             if pil.get("update_suggested") and best and best.get("gpu_ok", True) and best.get("download_url"):
+                if best["role"] in pinned_roles:
+                    skipped_pinned.append(best["role"])
+                    continue
                 r = self.download_role_update(
                     url=best["download_url"],
                     role=best["role"],
-                    drive=self.auto_download_drive,
+                    downloads_dir=self.downloads_dir,
                     item_id=best["id"],
                     replace_old=True,
                 )
@@ -1180,15 +2300,313 @@ class TrackerController:
         msg = (
             f"Updated {len(updated_names)} component(s): {', '.join(updated_names)}"
             if updated_names
-            else "All critical components are already up to date!"
+            else "All non-pinned critical components are already up to date!"
         )
-        return {"ok": True, "updated": updated_names, "message": msg}
+        if skipped_pinned:
+            msg += f" (📌 {len(skipped_pinned)} pinned skipped)"
+        return {"ok": True, "updated": updated_names, "skipped_pinned": skipped_pinned, "message": msg}
 
-    def rollback_role(self, role: str, drive: str) -> dict[str, Any]:
+    def install_all_config_components(self, *, gpu_profile: str | None = None) -> dict[str, Any]:
+        """One-click Quick Start installer: downloads all GPU-compatible missing/updatable components across all roles."""
+        if self.is_offline_mode():
+            return {"ok": False, "offline": True, "error": "Strict Offline Mode is active — disable Offline Mode to download components."}
+        if gpu_profile and gpu_profile.upper() in {"NVIDIA", "AMD", "ALL"}:
+            self.update_launcher_settings({"gpu_profile": gpu_profile.upper()})
+        active_gpu = self.gpu_profile
+        state = self.get_cockpit_state(gpu=active_gpu)
+        pinned_roles = dict(self.settings.get("pinned_roles") or {})
+        targets: list[dict[str, Any]] = []
+        for row in state.get("roles_table") or []:
+            best = row.get("best")
+            if not best or not best.get("download_url"):
+                continue
+            if not best.get("gpu_ok", True):
+                continue
+            if row["role"] in pinned_roles:
+                continue
+            if row.get("missing") or row.get("update_suggested"):
+                targets.append({"role": row["role"], "best": best})
+
+        if not targets:
+            return {
+                "ok": True,
+                "installed": [],
+                "failed": [],
+                "total": 0,
+                "gpu_profile": active_gpu,
+                "message": f"All {active_gpu}-compatible components are already installed!",
+            }
+
+        qs_key = "qs:batch"
+        installed: list[str] = []
+        failed: list[str] = []
+        total = len(targets)
+        try:
+            for idx, item in enumerate(targets, 1):
+                best = item["best"]
+                role = item["role"]
+                self._set_download_progress(
+                    qs_key,
+                    {
+                        "kind": "quickstart",
+                        "id": "batch",
+                        "title": best["title"],
+                        "role": role,
+                        "stage": "downloading",
+                        "current_index": idx,
+                        "total_count": total,
+                        "percent": round(((idx - 1) / total) * 100.0, 1),
+                    },
+                )
+                r = self.download_role_update(
+                    url=best["download_url"],
+                    role=role,
+                    downloads_dir=self.downloads_dir,
+                    item_id=best["id"],
+                    replace_old=True,
+                    confirm_untrusted=True,
+                )
+                if r.get("ok"):
+                    installed.append(best["title"])
+                else:
+                    failed.append(f"{best['title']} ({r.get('error', 'error')})")
+            self._set_download_progress(
+                qs_key,
+                {
+                    "kind": "quickstart",
+                    "id": "batch",
+                    "title": f"{len(installed)}/{total} components installed",
+                    "stage": "done",
+                    "current_index": total,
+                    "total_count": total,
+                    "percent": 100.0,
+                },
+            )
+        finally:
+            self._clear_download_progress(qs_key)
+
+        msg = (
+            f"Installed {len(installed)}/{total} component(s) for {active_gpu}!"
+            if installed
+            else f"Could not download components ({len(failed)} failed)."
+        )
+        return {
+            "ok": bool(installed) or total == 0,
+            "installed": installed,
+            "failed": failed,
+            "total": total,
+            "gpu_profile": active_gpu,
+            "message": msg,
+        }
+
+    def _infer_import_role(self, filename: str) -> str:
+        """Auto-detects the most appropriate component role from a local filename/folder name."""
+        low = (filename or "").lower()
+        tokenized = re.sub(r"[_\-\.]+", " ", filename or "").strip()
+        if any(ext in low for ext in (".toml", ".json", ".ini", ".pdb", "symbol", "config", "strings")):
+            return "4. Symboles / Config"
+        if any(k in low for k in ("xvd", "dump", "elf", "sprx", "self", "eboot", "inspector")):
+            return "7. Dumper / ELF-SPRX"
+        if any(k in low for k in ("shader", "dxil", "spirv", "spir-v", "rdna", "vulkan", "framelab", "graft")):
+            return "6. Shaders / GPU"
+        if any(k in low for k in ("rpf", "ttpf", "awc", "bcpack", "rage-tools", "sixng", "percystar", "openvi", "forge9")):
+            return "5. Outil RPF / RAGE 9"
+        if any(k in low for k in ("recomp", "llvm", "elf2cpp")):
+            return "3. Recompilateur Statique"
+        if any(k in low for k in ("ghidra", "ida", "decomp", "rageforge", "rage9-re")):
+            return "8. Décompilateur / IA RE"
+        probe = ScrapedItem(
+            id=f"probe:{low}",
+            source=SourceType.GITHUB_REPO,
+            title=tokenized or filename,
+            url=f"file:///{filename}",
+            summary=tokenized or filename,
+            category=Category.EMULATION,
+        )
+        _track, inferred, _deps = classify_role_and_deps(probe)
+        valid_roles = {r for r, _ in ALL_ROLES}
+        if inferred in valid_roles:
+            return inferred
+        return "2. Émulateur / Runtime"
+
+    def import_component_files(
+        self,
+        *,
+        paths: list[str],
+        role: str = "",
+        item_id: str | None = None,
+        replace_old: bool = True,
+    ) -> dict[str, Any]:
+        """Imports user-supplied local component files/folders into by_role/<role>/quarantine/ and registers them."""
+        import hashlib
+
+        valid_roles = {r for r, _ in ALL_ROLES}
+        clean_paths = [Path(str(p).strip()).expanduser() for p in (paths or []) if str(p).strip()]
+        if not clean_paths:
+            return {"ok": False, "error": "No file or folder selected."}
+
+        imported: list[dict[str, Any]] = []
+        errors: list[str] = []
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        for src in clean_paths:
+            if not src.exists():
+                errors.append(f"Path not found: {src}")
+                continue
+
+            target_role = role if (role in valid_roles) else self._infer_import_role(src.name)
+            role_dir = self.downloads_dir / "by_role" / _safe_role_folder(target_role)
+            q_dir = role_dir / "quarantine"
+            q_dir.mkdir(parents=True, exist_ok=True)
+
+            try:
+                if src.is_dir():
+                    dst = q_dir / src.name
+                    if dst.exists() and dst.resolve() != src.resolve():
+                        shutil.rmtree(dst, ignore_errors=True)
+                    if dst.resolve() != src.resolve():
+                        shutil.copytree(src, dst, dirs_exist_ok=True)
+                    size_bytes = sum(f.stat().st_size for f in dst.rglob("*") if f.is_file())
+                    sha = ""
+                else:
+                    dst = q_dir / src.name
+                    if dst.resolve() != src.resolve():
+                        shutil.copy2(src, dst)
+                    size_bytes = dst.stat().st_size
+                    h = hashlib.sha256()
+                    with dst.open("rb") as fh:
+                        while chunk := fh.read(65536):
+                            h.update(chunk)
+                    sha = h.hexdigest()
+                    if replace_old:
+                        replace_previous_role_files(q_dir, dst)
+
+                resolved_item_id = item_id
+                resolved_url = f"local://{_safe_role_folder(target_role)}/{dst.name}"
+                if not resolved_item_id:
+                    # Try matching current best candidate for that role, else register a clean local component item
+                    local_id = f"local:{_safe_role_folder(target_role).lower()}:{dst.name.lower()}"
+                    cat_for_role = (
+                        Category.DUMPS
+                        if target_role == "7. Dumper / ELF-SPRX"
+                        else (
+                            Category.AI_RE
+                            if target_role == "8. Décompilateur / IA RE"
+                            else (
+                                Category.DECOMP
+                                if target_role in {"1. Portage / Exe PC", "3. Recompilateur Statique", "4. Symboles / Config", "5. Outil RPF / RAGE 9"}
+                                else Category.EMULATION
+                            )
+                        )
+                    )
+                    # Include a clean role hint in summary so classify_role_and_deps always maps back to target_role
+                    role_hint_map = {
+                        "1. Portage / Exe PC": "native pc build",
+                        "2. Émulateur / Runtime": "xbox series compatibility layer runtime",
+                        "3. Recompilateur Statique": "static recompiler",
+                        "4. Symboles / Config": "symbols.toml config",
+                        "5. Outil RPF / RAGE 9": "rpf9 rage9 archive tool",
+                        "6. Shaders / GPU": "rdna2-dis dxil shader gpu",
+                        "7. Dumper / ELF-SPRX": "xvdtool dumper elf sprx",
+                        "8. Décompilateur / IA RE": "ghidra decompiler re toolkit",
+                    }
+                    local_item = ScrapedItem(
+                        id=local_id,
+                        source=SourceType.GITHUB_REPO,
+                        category=cat_for_role,
+                        playability_status="Local Import",
+                        title=dst.name,
+                        url=resolved_url,
+                        summary=f"[Local Import · {target_role}] {dst.name} ({role_hint_map.get(target_role, '')})",
+                        author="Local",
+                        published_at=now_iso,
+                        updated_at=now_iso,
+                        relevance_score=85,
+                        tags=["local-import", target_role],
+                        extra={
+                            "local_import": True,
+                            "portwatch_verified": True,
+                            "portwatch_gpu": ["NVIDIA", "AMD"],
+                        },
+                    )
+                    self.storage.save_new_items([local_item])
+                    resolved_item_id = local_id
+
+                self.storage.record_download(
+                    url=resolved_url,
+                    filename=dst.name,
+                    saved_path=str(dst),
+                    sha256=sha,
+                    size_bytes=size_bytes,
+                    item_id=resolved_item_id,
+                    item_updated_at=now_iso,
+                )
+                imported.append(
+                    {
+                        "name": dst.name,
+                        "role": target_role,
+                        "saved_path": str(dst),
+                        "size_bytes": size_bytes,
+                        "sha256": sha,
+                    }
+                )
+                self._add_auto_log(f"📥 Imported component [{target_role}]: {dst.name}")
+            except OSError as exc:
+                errors.append(f"{src.name}: {exc}")
+
+        if not imported:
+            return {"ok": False, "error": "; ".join(errors) or "Failed to import component files."}
+        return {
+            "ok": True,
+            "imported": imported,
+            "errors": errors,
+            "count": len(imported),
+            "message": f"Imported {len(imported)} component file(s) successfully!",
+        }
+
+    def pick_and_import_component_files(
+        self,
+        *,
+        role: str = "",
+        item_id: str | None = None,
+        pick_folder: bool = False,
+    ) -> dict[str, Any]:
+        """Opens a native file/folder dialog to import local component files into SixDeck."""
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            initial = str(self.downloads_dir if self.downloads_dir.exists() else BASE_DIR)
+            if pick_folder:
+                chosen = filedialog.askdirectory(title="Select Component Folder to Import", initialdir=initial)
+                paths = [chosen] if chosen else []
+            else:
+                chosen_tuple = filedialog.askopenfilenames(
+                    title="Select Component File(s) to Import",
+                    initialdir=initial,
+                    filetypes=[
+                        ("All Component Files", "*.*"),
+                        ("Archives", "*.zip *.7z *.tar.gz *.rar"),
+                        ("Executables & Libraries", "*.exe *.dll *.elf *.sprx"),
+                        ("Config & Symbols", "*.toml *.json *.ini *.pdb *.txt"),
+                    ],
+                )
+                paths = list(chosen_tuple) if chosen_tuple else []
+            root.destroy()
+            if not paths:
+                return {"ok": True, "cancelled": True, "count": 0}
+            return self.import_component_files(paths=paths, role=role, item_id=item_id)
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def rollback_role(self, role: str, drive: str = "", *, downloads_dir: str | Path | None = None) -> dict[str, Any]:
         """Restores the previous N-1 backup from by_role/<role>/_backup/."""
-        target_root = self._resolve_drive_target(drive)
+        target_root = self._resolve_downloads_root(downloads_dir, drive=drive)
         if target_root is None:
-            return {"ok": False, "error": "Storage drive not found."}
+            return {"ok": False, "error": "Storage directory not found."}
         role_dir = target_root / "by_role" / _safe_role_folder(role)
         backup_dir = role_dir / "_backup"
         q_dir = role_dir / "quarantine"
@@ -1222,36 +2640,274 @@ class TrackerController:
         self._add_auto_log(f"🧹 Launcher cache cleared ({removed} item(s)).")
         return {"ok": True, "message": f"Launcher cache cleared ({removed} item(s))."}
 
-    def install_workshop_mod(self, workshop_id: str) -> dict[str, Any]:
+    def _set_download_progress(self, key: str, payload: dict[str, Any]) -> None:
+        with self._lock:
+            prev = self._active_downloads.get(key) or {}
+            self._active_downloads[key] = {**prev, **payload, "key": key}
+
+    def _clear_download_progress(self, key: str) -> None:
+        with self._lock:
+            self._active_downloads.pop(key, None)
+
+    def get_active_downloads(self) -> dict[str, dict[str, Any]]:
+        with self._lock:
+            return {k: dict(v) for k, v in self._active_downloads.items()}
+
+    def _workshop_hubs_cache_path(self) -> Path:
+        return BASE_DIR / "data" / "workshop_hubs_cache.json"
+
+    def _load_workshop_hubs_cache(self) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+        p = self._workshop_hubs_cache_path()
+        if not p.exists():
+            return [], {}
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return list(data.get("hub_items") or []), dict(data.get("registry_versions") or {})
+        except Exception:
+            pass
+        return [], {}
+
+    def sync_mod_hubs_and_registries(self) -> dict[str, Any]:
+        """Queries optional Modding Hubs (Nexus Mods, GameBanana, RSS) & Package Registries (Crates.io, PyPI, NuGet)."""
+        if self.is_offline_mode():
+            return {"ok": False, "offline": True, "error": "Strict Offline Mode is active — disable Offline Mode to sync hubs & registries."}
+        hub_cfg = self.config.mod_hubs
+
+        async def _run() -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+            hub_items: list[dict[str, Any]] = []
+            registry_versions: dict[str, dict[str, Any]] = {}
+            async with httpx.AsyncClient(follow_redirects=True, timeout=10.0) as client:
+                if hub_cfg.enabled:
+                    if hub_cfg.nexus_game_domain and self.config.nexus_api_key:
+                        hub_items.extend(
+                            await fetch_nexus_mods(
+                                hub_cfg.nexus_game_domain,
+                                self.config.nexus_api_key,
+                                client,
+                            )
+                        )
+                    if hub_cfg.gamebanana_game_id or hub_cfg.gamebanana_query:
+                        hub_items.extend(
+                            await fetch_gamebanana_mods(
+                                hub_cfg.gamebanana_query,
+                                client,
+                                game_id=hub_cfg.gamebanana_game_id or None,
+                            )
+                        )
+                    if hub_cfg.rss_feeds:
+                        hub_items.extend(await fetch_modding_rss_feeds(hub_cfg.rss_feeds, client))
+
+                # Resolve official stable releases from Crates.io, PyPI, and NuGet
+                reg_targets: list[dict[str, str]] = [
+                    {"id": str(w["id"]), "name": str(w["name"]), "registry": str(w["registry"]), "package": str(w["package"]), "category": str(w["category"]), "risk": str(w["risk"])}
+                    for w in WORKSHOP_CATALOG
+                    if w.get("registry") and w.get("package")
+                ]
+                for rt in hub_cfg.package_registries or []:
+                    reg_targets.append(
+                        {
+                            "id": rt.id or f"reg-{rt.registry}-{rt.package}".lower(),
+                            "name": rt.name or rt.package,
+                            "registry": rt.registry,
+                            "package": rt.package,
+                            "category": rt.category,
+                            "risk": rt.risk,
+                        }
+                    )
+                known_ws_ids = {w["id"] for w in WORKSHOP_CATALOG}
+                for tgt in reg_targets:
+                    info = await resolve_registry_package(tgt["registry"], tgt["package"], client)
+                    if not info:
+                        continue
+                    registry_versions[tgt["id"]] = info
+                    registry_versions[f"{tgt['registry']}:{tgt['package']}"] = info
+                    if tgt["id"] not in known_ws_ids:
+                        hub_items.append(
+                            {
+                                "id": tgt["id"],
+                                "name": tgt["name"],
+                                "author": info["registry"].upper(),
+                                "version": f"v{info['version']}" if not str(info["version"]).startswith("v") else str(info["version"]),
+                                "category": tgt["category"],
+                                "source_hub": info["registry"].upper(),
+                                "risk": tgt["risk"],
+                                "desc": info.get("description") or f"Official {info['registry']} package ({tgt['package']})",
+                                "url": info.get("homepage") or info.get("download_url") or "",
+                                "download_url": info.get("download_url") or "",
+                                "image": "",
+                                "accent": "linear-gradient(135deg,#0f766e,#17122b)",
+                            }
+                        )
+            return hub_items, registry_versions
+
+        try:
+            hub_items, registry_versions = asyncio.run(_run())
+            cp = self._workshop_hubs_cache_path()
+            cp.parent.mkdir(parents=True, exist_ok=True)
+            cp.write_text(
+                json.dumps(
+                    {"hub_items": hub_items, "registry_versions": registry_versions},
+                    indent=2,
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            self._add_auto_log(
+                f"🧩 Workshop Hubs & Registries synced: {len(hub_items)} hub item(s), {len(registry_versions)} registry version(s)."
+            )
+            return {
+                "ok": True,
+                "hub_items_count": len(hub_items),
+                "registries_count": len(registry_versions),
+                "message": f"Synced {len(hub_items)} hub items & {len(registry_versions)} package registry versions!",
+            }
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def _active_game_dir(self) -> Path:
+        return Path(str(self.settings.get("install_dir") or self._discover_default_game_dir()))
+
+    def sync_mods_game_links(self) -> dict[str, Any]:
+        """Stages active mods non-destructively and verifies/creates the <game_dir>/sixdeck_mods link."""
+        game_dir = self._active_game_dir()
+        vanilla = bool(self.settings.get("vanilla_mode", False))
+        stage_dir = self._mod_stage_dir()
+        res = self.mods.link_mods_to_game(game_dir, stage_dir, vanilla=vanilla)
+        summary = str((res.get("game_link_status") or {}).get("summary") or "Mods synced with game directory.")
+        self._add_auto_log(f"🔗 {summary}")
+        return {"ok": True, **res, "message": summary}
+
+    def delete_mod(self, mod_id: str) -> dict[str, Any]:
+        """Deletes an installed mod (entry + local files inside Mods/) and refreshes game links."""
+        res = self.mods.delete_mod(
+            mod_id,
+            stage_dir=self._mod_stage_dir(),
+            game_dir=self._active_game_dir(),
+            vanilla=bool(self.settings.get("vanilla_mode", False)),
+        )
+        if res.get("ok"):
+            self._add_auto_log(f"🗑️ {res.get('message')}")
+        return res
+
+    def toggle_mod(self, mod_id: str, enabled: bool) -> dict[str, Any]:
+        res = self.mods.toggle(
+            mod_id,
+            enabled,
+            runtime_version=str(self.settings.get("selected_runtime") or ""),
+        )
+        if res.get("ok"):
+            self.mods.link_mods_to_game(
+                self._active_game_dir(),
+                self._mod_stage_dir(),
+                vanilla=bool(self.settings.get("vanilla_mode", False)),
+            )
+        return res
+
+    def move_mod(self, mod_id: str, direction: str) -> dict[str, Any]:
+        res = self.mods.move(mod_id, direction)
+        if res.get("ok"):
+            self.mods.link_mods_to_game(
+                self._active_game_dir(),
+                self._mod_stage_dir(),
+                vanilla=bool(self.settings.get("vanilla_mode", False)),
+            )
+        return res
+
+    def install_workshop_mod(self, workshop_id: str, *, confirm_untrusted: bool = False) -> dict[str, Any]:
+        if self.is_offline_mode():
+            return {"ok": False, "offline": True, "error": "Strict Offline Mode is active — disable Offline Mode to install Workshop mods."}
         pw_snap = load_portwatch_snapshot(PORTWATCH_SNAPSHOT)
-        ws_list = self.mods.get_state(portwatch_tools=pw_snap.get("tools") or []).get("workshop") or []
+        hub_items, reg_versions = self._load_workshop_hubs_cache()
+        ws_list = self.mods.get_state(
+            portwatch_tools=pw_snap.get("tools") or [],
+            hub_items=hub_items,
+            registry_versions=reg_versions,
+        ).get("workshop") or []
         w = next((x for x in ws_list if x["id"] == workshop_id), None)
         if not w:
             return {"ok": False, "error": "Workshop mod not found."}
 
-        async def _dl() -> dict[str, Any]:
-            async with httpx.AsyncClient(follow_redirects=True) as client:
-                rep = await quarantine_download(
+        if bool(self.settings.get("enforce_provenance", self.config.sandbox_provenance.enforce_confirmation)) and not confirm_untrusted:
+            prov = asyncio.run(
+                check_provenance_async(
                     w["url"],
+                    trusted_owners=self._effective_trusted_owners(),
+                    github_token=self.config.github_token,
+                    min_repo_age_days=self.config.sandbox_provenance.min_repo_age_days,
+                )
+            )
+            if prov.requires_confirmation:
+                return {
+                    "ok": False,
+                    "requires_confirmation": True,
+                    "provenance": prov.to_dict(),
+                    "error": "Unverified source — explicit confirmation required before download.",
+                }
+
+        dl_key = f"mod:{workshop_id}"
+        self._set_download_progress(
+            dl_key,
+            {
+                "kind": "mod",
+                "id": workshop_id,
+                "title": w["name"],
+                "stage": "connecting",
+                "downloaded_bytes": 0,
+                "total_bytes": 0,
+                "percent": None,
+                "speed_bps": 0,
+            },
+        )
+
+        def _on_prog(info: dict[str, Any]) -> None:
+            self._set_download_progress(
+                dl_key,
+                {
+                    "kind": "mod",
+                    "id": workshop_id,
+                    "title": w["name"],
+                    **info,
+                },
+            )
+
+        async def _dl() -> dict[str, Any]:
+            dl_target = str(w.get("download_url") or w["url"])
+            mirrors = get_mirrors_for_url(dl_target, self.config.mirrors)
+            async with httpx.AsyncClient(follow_redirects=True) as client:
+                rep, used_url, used_mirror = await download_with_mirror_fallback(
+                    dl_target,
+                    mirrors,
                     self.mods.mods_dir,
                     client,
+                    gitea_hosts=self.config.sources.alt_git.gitea_instances,
                     virustotal_api_key=self.config.virustotal_api_key,
+                    on_progress=_on_prog,
                 )
                 return {
                     "ok": rep.saved_path is not None,
                     "saved_path": str(rep.saved_path or ""),
                     "defender": rep.defender_status,
+                    "used_url": used_url,
+                    "used_mirror": used_mirror,
                 }
 
         try:
             r = asyncio.run(_dl())
             if r.get("ok"):
                 self.mods.register_installed_workshop_mod(workshop_id, r["saved_path"], fallback_entry=w)
+                self.mods.link_mods_to_game(
+                    self._active_game_dir(),
+                    self._mod_stage_dir(),
+                    vanilla=bool(self.settings.get("vanilla_mode", False)),
+                )
                 self._add_auto_log(f"🎨 Workshop tool installed (Defender OK): {w['name']}")
                 return {"ok": True, "message": f"{w['name']} installed & verified by Defender!"}
             return {"ok": False, "error": "Download failed."}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
+        finally:
+            self._clear_download_progress(dl_key)
 
     def _warmup_boot_cache(self) -> None:
         try:
@@ -1265,12 +2921,14 @@ class TrackerController:
             except Exception:
                 pass
             try:
-                self.run_boot_test(self.auto_download_drive)
+                self.run_boot_test()
             except Exception:
                 pass
-            if bool(self.settings.get("check_updates_on_startup", True)):
+            if self.is_offline_mode():
+                self._add_auto_log("✈️ Strict Offline Mode enabled — skipped all startup network requests.")
+            elif bool(self.settings.get("check_updates_on_startup", True)):
                 with self._lock:
-                    self._startup_stage = "Syncing latest GitHub & PortWatch releases..."
+                    self._startup_stage = "Syncing PortWatch VI & GTA VI PC Race..."
                 try:
                     self.sync_portwatch()
                 except Exception:
@@ -1283,7 +2941,9 @@ class TrackerController:
                 self._startup_stage = "Ready"
 
     def check_updates_now(self) -> dict[str, Any]:
-        """Runs an explicit PortWatch VI sync + update check and returns pending update status."""
+        """Runs an explicit PortWatch VI + GTA VI PC Race sync + update check and returns pending update status."""
+        if self.is_offline_mode():
+            return {"ok": False, "offline": True, "error": "Strict Offline Mode is active — disable Offline Mode to check for updates."}
         res = self.sync_portwatch()
         if not res.get("ok"):
             return res
@@ -1295,32 +2955,76 @@ class TrackerController:
             "checked_at": self._last_update_check,
             "builds": res.get("builds", 0),
             "tools": res.get("tools", 0),
+            "pc_race_projects": res.get("pc_race_projects", 0),
         }
 
-    def sync_portwatch(self) -> dict[str, Any]:
-        """Synchronizes leaderboard, tools, and news from PortWatch VI into tracker.db."""
+    def sync_pc_race(self) -> dict[str, Any]:
+        """Synchronizes leaderboard & live updates from GTA VI PC Race (vuyp/gta6-pc-race) into tracker.db."""
+        if self.is_offline_mode():
+            return {"ok": False, "offline": True, "error": "Strict Offline Mode is active — network sync is blocked."}
+
         async def _run() -> list[ScrapedItem]:
             async with httpx.AsyncClient(follow_redirects=True) as client:
-                pw = PortWatchScraper(self.config, client, snapshot_path=PORTWATCH_SNAPSHOT)
-                return await pw.fetch()
+                pr = PcRaceScraper(self.config, client, snapshot_path=PC_RACE_SNAPSHOT)
+                return await pr.fetch()
 
         try:
             items = asyncio.run(_run())
             new_items = self.storage.save_new_items(items) if items else []
+            snap = load_pc_race_snapshot(PC_RACE_SNAPSHOT)
+            self._add_auto_log(
+                f"🏁 GTA VI PC Race synced: {len(snap.get('leaderboard') or [])} projects, "
+                f"{len(snap.get('updates') or [])} updates (+{len(new_items)} new)"
+            )
+            return {
+                "ok": True,
+                "projects": len(snap.get("leaderboard") or []),
+                "updates": len(snap.get("updates") or []),
+                "new_saved": len(new_items),
+                "checked": snap.get("checked", ""),
+            }
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def sync_portwatch(self) -> dict[str, Any]:
+        """Synchronizes both primary trackers (PortWatch VI + GTA VI PC Race) into tracker.db."""
+        if self.is_offline_mode():
+            return {"ok": False, "offline": True, "error": "Strict Offline Mode is active — network sync is blocked."}
+
+        async def _run() -> tuple[list[ScrapedItem], list[ScrapedItem]]:
+            async with httpx.AsyncClient(follow_redirects=True) as client:
+                pw = PortWatchScraper(self.config, client, snapshot_path=PORTWATCH_SNAPSHOT)
+                pr = PcRaceScraper(self.config, client, snapshot_path=PC_RACE_SNAPSHOT)
+                res_pw, res_pr = await asyncio.gather(pw.fetch(), pr.fetch(), return_exceptions=True)
+                if isinstance(res_pw, Exception):
+                    self._add_auto_log(f"⚠️ PortWatch VI sync warning: {res_pw}")
+                if isinstance(res_pr, Exception):
+                    self._add_auto_log(f"⚠️ GTA VI PC Race sync warning: {res_pr}")
+                pw_items = res_pw if isinstance(res_pw, list) else []
+                pr_items = res_pr if isinstance(res_pr, list) else []
+                return pw_items, pr_items
+
+        try:
+            pw_items, pr_items = asyncio.run(_run())
+            all_items = [*pw_items, *pr_items]
+            new_items = self.storage.save_new_items(all_items) if all_items else []
             snap = load_portwatch_snapshot(PORTWATCH_SNAPSHOT)
+            pr_snap = load_pc_race_snapshot(PC_RACE_SNAPSHOT)
             with self._lock:
                 self._updates_checked = True
                 self._last_update_check = datetime.now().strftime("%H:%M:%S")
             self._add_auto_log(
-                f"🏆 PortWatch VI synced: {len(snap.get('leaderboard') or [])} builds, "
-                f"{len(snap.get('tools') or [])} tools (+{len(new_items)} new)"
+                f"🏆 Trackers synced — PortWatch VI: {len(snap.get('leaderboard') or [])} builds, "
+                f"{len(snap.get('tools') or [])} tools · PC Race: {len(pr_snap.get('leaderboard') or [])} projects (+{len(new_items)} new)"
             )
             return {
                 "ok": True,
                 "builds": len(snap.get("leaderboard") or []),
                 "tools": len(snap.get("tools") or []),
+                "pc_race_projects": len(pr_snap.get("leaderboard") or []),
+                "pc_race_updates": len(pr_snap.get("updates") or []),
                 "new_saved": len(new_items),
-                "updated": snap.get("updated", ""),
+                "updated": snap.get("updated", "") or pr_snap.get("checked", ""),
             }
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
@@ -1333,19 +3037,30 @@ class TrackerController:
                 self.auto_logs = self.auto_logs[-80:]
 
     def set_auto_config(
-        self, *, enabled: bool, drive: str, min_score: int = 75, gpu_profile: str | None = None
+        self,
+        *,
+        enabled: bool,
+        drive: str = "",
+        downloads_dir: str | None = None,
+        min_score: int = 75,
+        gpu_profile: str | None = None,
     ) -> dict[str, Any]:
+        patch: dict[str, Any] = {"auto_download_enabled": bool(enabled)}
+        if downloads_dir is not None:
+            patch["downloads_dir"] = downloads_dir
+        elif drive:
+            patch["auto_download_drive"] = drive
+        if gpu_profile and gpu_profile.upper() in {"NVIDIA", "AMD", "ALL"}:
+            patch["gpu_profile"] = gpu_profile.upper()
         with self._lock:
-            self.auto_download_enabled = bool(enabled)
-            if drive:
-                self.auto_download_drive = drive.strip().rstrip(":\\/").upper()
             self.auto_download_min_score = max(40, min(100, int(min_score)))
-            if gpu_profile and gpu_profile.upper() in {"NVIDIA", "AMD", "ALL"}:
-                self.gpu_profile = gpu_profile.upper()
+        res = self.update_launcher_settings(patch)
+        if not res.get("ok"):
+            return res
         self._add_auto_log(
-            f"Config : GPU {self.gpu_profile} | Auto-DL VM {'ACTIVÉ' if enabled else 'DÉSACTIVÉ'} (Disque {self.auto_download_drive}:)"
+            f"Config: GPU {self.gpu_profile} | Auto-DL {'ENABLED' if enabled else 'DISABLED'} ({self.downloads_dir})"
         )
-        return {"ok": True}
+        return {"ok": True, "downloads_dir": str(self.downloads_dir)}
 
     def start(
         self,
@@ -1354,6 +3069,8 @@ class TrackerController:
         silent: bool = False,
         interval_minutes: int = 60,
     ) -> dict[str, Any]:
+        if self.is_offline_mode():
+            return {"ok": False, "offline": True, "error": "Strict Offline Mode is active — disable Offline Mode to start live watch."}
         with self._lock:
             if self.running or self.watch_state in {"starting", "running"}:
                 return {"ok": True, "message": "Watch is already running."}
@@ -1385,13 +3102,41 @@ class TrackerController:
             self.last_message = "⏳ Stopping..."
             return {"ok": True}
 
-    def _resolve_drive_target(self, drive: str) -> Path | None:
+    def _resolve_drive_target(self, drive: str | None = None) -> Path | None:
+        raw = (drive or "").strip()
+        if not raw:
+            return self._resolve_downloads_root()
+        if ("/" in raw or "\\" in raw) and len(raw) > 3:
+            return self._resolve_downloads_root(raw)
+        key = raw.rstrip(":\\/").upper()
+        if key == self.auto_download_drive.upper():
+            return self._resolve_downloads_root()
         drives = {d.letter.upper(): d for d in list_local_drives()}
-        key = drive.strip().rstrip(":\\/").upper()
         if key not in drives:
-            return None
+            # Never fail with "Drive 'D' not found": transparently fall back to the launcher's downloads_dir
+            return self._resolve_downloads_root()
         target = Path(drives[key].root) / "GTA6_Sandbox_Downloads"
         target.mkdir(parents=True, exist_ok=True)
+        return target
+
+    def _resolve_downloads_root(
+        self,
+        downloads_dir: str | Path | None = None,
+        *,
+        drive: str | None = None,
+        create: bool = True,
+    ) -> Path | None:
+        if downloads_dir is not None and str(downloads_dir).strip():
+            target = self._normalize_downloads_dir(downloads_dir)
+        elif drive and drive.strip():
+            return self._resolve_drive_target(drive)
+        else:
+            target = self.downloads_dir
+        if create:
+            try:
+                target.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                return None
         return target
 
     async def _download_and_replace_async(
@@ -1399,22 +3144,77 @@ class TrackerController:
         *,
         url: str,
         role: str,
-        drive: str,
+        drive: str = "",
+        downloads_dir: str | Path | None = None,
         client: httpx.AsyncClient,
         item_id: str | None = None,
         replace_old: bool = True,
+        confirm_untrusted: bool = False,
     ) -> dict[str, Any]:
-        target_root = self._resolve_drive_target(drive)
+        target_root = self._resolve_downloads_root(downloads_dir, drive=drive)
         if target_root is None:
-            return {"ok": False, "error": f"Drive '{drive}' not found."}
+            return {"ok": False, "error": f"Download directory not accessible: {downloads_dir or drive or self.downloads_dir}"}
+
+        if bool(self.settings.get("enforce_provenance", self.config.sandbox_provenance.enforce_confirmation)) and not confirm_untrusted:
+            prov = await check_provenance_async(
+                url,
+                client=client,
+                trusted_owners=self._effective_trusted_owners(),
+                github_token=self.config.github_token,
+                min_repo_age_days=self.config.sandbox_provenance.min_repo_age_days,
+            )
+            if prov.requires_confirmation:
+                return {
+                    "ok": False,
+                    "requires_confirmation": True,
+                    "provenance": prov.to_dict(),
+                    "error": "Unverified source — explicit confirmation required before download.",
+                }
 
         role_dir = target_root / "by_role" / _safe_role_folder(role)
-        report = await quarantine_download(
-            url,
-            role_dir,
-            client,
-            virustotal_api_key=self.config.virustotal_api_key,
+        dl_key = f"role:{role}"
+        self._set_download_progress(
+            dl_key,
+            {
+                "kind": "component",
+                "id": role,
+                "title": role,
+                "stage": "connecting",
+                "downloaded_bytes": 0,
+                "total_bytes": 0,
+                "percent": None,
+                "speed_bps": 0,
+            },
         )
+
+        def _on_prog(info: dict[str, Any]) -> None:
+            self._set_download_progress(
+                dl_key,
+                {
+                    "kind": "component",
+                    "id": role,
+                    "title": role,
+                    **info,
+                },
+            )
+
+        mirrors = get_mirrors_for_url(url, self.config.mirrors)
+        used_url = url
+        used_mirror = False
+        try:
+            report, used_url, used_mirror = await download_with_mirror_fallback(
+                url,
+                mirrors,
+                role_dir,
+                client,
+                gitea_hosts=self.config.sources.alt_git.gitea_instances,
+                virustotal_api_key=self.config.virustotal_api_key,
+                on_progress=_on_prog,
+            )
+        finally:
+            self._clear_download_progress(dl_key)
+        if used_mirror:
+            self._add_auto_log(f"🪞 Fallback mirror used for [{role}]: {used_url}")
 
         removed: list[str] = []
         if replace_old and report.saved_path is not None:
@@ -1453,34 +3253,47 @@ class TrackerController:
         }
 
     def download_role_update(
-        self, *, url: str, role: str, drive: str, item_id: str | None = None, replace_old: bool = True
+        self,
+        *,
+        url: str,
+        role: str,
+        drive: str = "",
+        downloads_dir: str | Path | None = None,
+        item_id: str | None = None,
+        replace_old: bool = True,
+        confirm_untrusted: bool = False,
     ) -> dict[str, Any]:
+        if self.is_offline_mode():
+            return {"ok": False, "offline": True, "error": "Strict Offline Mode is active — disable Offline Mode to download components."}
         async def _run() -> dict[str, Any]:
             async with httpx.AsyncClient(follow_redirects=True) as client:
                 return await self._download_and_replace_async(
                     url=url,
                     role=role,
                     drive=drive,
+                    downloads_dir=downloads_dir,
                     client=client,
                     item_id=item_id,
                     replace_old=replace_old,
+                    confirm_untrusted=confirm_untrusted,
                 )
 
         try:
             res = asyncio.run(_run())
             if res.get("ok"):
                 rem = res.get("removed_previous") or []
-                rem_txt = f" ({len(rem)} ancienne(s) version(s) remplacée(s))" if rem else ""
-                self._add_auto_log(f"✅ [{role}] Téléchargé sur {drive}:{rem_txt}")
+                rem_txt = f" ({len(rem)} previous version(s) replaced)" if rem else ""
+                dest = str(downloads_dir or self.downloads_dir)
+                self._add_auto_log(f"✅ [{role}] Downloaded to {dest}{rem_txt}")
             return res
         except Exception as exc:
-            self._add_auto_log(f"❌ [{role}] Échec téléchargement : {exc}")
+            self._add_auto_log(f"❌ [{role}] Download failed: {exc}")
             return {"ok": False, "error": str(exc)}
 
-    def run_boot_test(self, drive: str) -> dict[str, Any]:
-        target = self._resolve_drive_target(drive)
+    def run_boot_test(self, drive: str = "", *, downloads_dir: str | Path | None = None) -> dict[str, Any]:
+        target = self._resolve_downloads_root(downloads_dir, drive=drive)
         if target is None:
-            return {"ok": False, "error": f"Drive '{drive}' not found."}
+            return {"ok": False, "error": f"Storage directory not found: {downloads_dir or drive}"}
         game_dir_str = str(self.settings.get("install_dir") or "").strip()
         dump_dir = Path(game_dir_str) if game_dir_str else None
         report = run_boot_and_compile_test(target, dump_folder=dump_dir)
@@ -1500,6 +3313,38 @@ class TrackerController:
             self._boot_cache = payload
         return payload
 
+    def pick_downloads_dir(self) -> dict[str, Any]:
+        """Opens a native folder dialog to select the installation/download directory for components & mods."""
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            initial = str(self.downloads_dir if self.downloads_dir.exists() else BASE_DIR)
+            chosen = filedialog.askdirectory(
+                title="Select Components & Downloads Directory",
+                initialdir=initial,
+            )
+            root.destroy()
+            if chosen:
+                norm = str(Path(chosen))
+                res = self.update_launcher_settings({"downloads_dir": norm})
+                if not res.get("ok"):
+                    return res
+                return {"ok": True, "downloads_dir": str(self.downloads_dir)}
+            return {"ok": True, "downloads_dir": ""}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def open_downloads_dir(self) -> dict[str, Any]:
+        target = self._resolve_downloads_root(create=True)
+        if target is None:
+            return {"ok": False, "error": "Download directory not accessible."}
+        _open_folder_in_os(target)
+        return {"ok": True, "downloads_dir": str(target)}
+
     def pick_game_dir(self) -> dict[str, Any]:
         """Opens a native Windows folder dialog to import the user's own local dump directory."""
         try:
@@ -1517,16 +3362,22 @@ class TrackerController:
             root.destroy()
             if chosen:
                 chosen_p = Path(chosen)
-                # Smart auto-resolve if the user picked a parent folder containing the actual dump subfolder
-                if not (chosen_p / "game_scarlett_master.exe").is_file():
-                    sub_exes = [s for s in chosen_p.rglob("game_scarlett_master.exe") if s.is_file()]
-                    if sub_exes:
-                        best_sub = next((s.parent for s in sub_exes if any(s.parent.glob("*.rpf"))), sub_exes[0].parent)
-                        chosen_p = best_sub
+                # Smart auto-resolve via MicrosoftGame.Config or nested game_scarlett_master.exe
+                if not resolve_gdk_title_exe(chosen_p, allow_fallback=False):
+                    sub_cfgs = [c for c in chosen_p.rglob("MicrosoftGame.Config") if c.is_file()]
+                    if sub_cfgs:
+                        chosen_p = sub_cfgs[0].parent
+                    else:
+                        sub_exes = [s for s in chosen_p.rglob("game_scarlett_master.exe") if s.is_file()]
+                        if sub_exes:
+                            best_sub = next((s.parent for s in sub_exes if any(s.parent.glob("*.rpf"))), sub_exes[0].parent)
+                            chosen_p = best_sub
                 norm = str(chosen_p)
                 self.update_launcher_settings({"install_dir": norm})
                 dump_st = self._inspect_dump_status()
-                self._add_auto_log(f"📂 Local dump directory set: {norm} (ready={dump_st['ready']}, rpf={dump_st['rpf_count']})")
+                self._add_auto_log(
+                    f"📂 Local dump directory set: {norm} (ready={dump_st['ready']}, source={dump_st.get('source') or 'n/a'}, rpf={dump_st['rpf_count']})"
+                )
                 return {"ok": True, "install_dir": norm, "dump_status": dump_st}
             return {"ok": True, "install_dir": "", "dump_status": self._inspect_dump_status()}
         except Exception as exc:
@@ -1534,20 +3385,20 @@ class TrackerController:
 
     def open_game_dir(self) -> dict[str, Any]:
         gdir = Path(str(self.settings.get("install_dir") or self._discover_default_game_dir()))
-        gdir.mkdir(parents=True, exist_ok=True)
-        if os.name == "nt":
-            os.startfile(str(gdir))  # type: ignore[attr-defined]
+        _open_folder_in_os(gdir)
         return {"ok": True, "install_dir": str(gdir)}
 
     def reclassify_database(self) -> dict[str, Any]:
         res = self.storage.reclassify_all_items(config=self.config)
         self._add_auto_log(
-            f"🔄 Base reclassée & scores recalibrés : {res['updated']} items "
-            f"(Recomp PC: {res['recomp_count']}, Ému Xbox: {res['xbox_count']}, Commun: {res['common_count']})"
+            f"🔄 Database reclassified & scores recalibrated: {res['updated']} items "
+            f"(PC Recomp: {res['recomp_count']}, Console Emu: {res['xbox_count']}, Shared: {res['common_count']})"
         )
         return {"ok": True, **res}
 
     def run_curated_discovery(self) -> dict[str, Any]:
+        if self.is_offline_mode():
+            return {"ok": False, "offline": True, "error": "Strict Offline Mode is active — discovery disabled."}
         async def _run() -> dict[str, Any]:
             async with httpx.AsyncClient(follow_redirects=True) as client:
                 return await discover_curated_repos(
@@ -1561,8 +3412,8 @@ class TrackerController:
             res = asyncio.run(_run())
             found = res.get("newly_discovered") or []
             self._add_auto_log(
-                f"🧭 Auto-découverte curatée : +{len(found)} nouveau(x) dépôt(s) "
-                f"(total suivi auto : {res.get('total_discovered', 0)})"
+                f"🧭 Curated auto-discovery: +{len(found)} new repo(s) "
+                f"(total auto-tracked: {res.get('total_discovered', 0)})"
             )
             return res
         except Exception as exc:
@@ -1578,6 +3429,17 @@ class TrackerController:
         current_version: str = "",
         current_date: str = "",
     ) -> dict[str, Any]:
+        if self.is_offline_mode():
+            return {
+                "ok": False,
+                "offline": True,
+                "current_title": current_title,
+                "current_version": current_version or "Installed",
+                "new_version": "Offline",
+                "differences": ["Strict Offline Mode is enabled — remote version comparison is disabled."],
+                "commits": [],
+                "error": "Strict Offline Mode is active.",
+            }
         try:
             dl_by_url, dl_by_item = self.storage.get_download_history_map()
             installed_rec = (dl_by_item.get(item_id) if item_id else None) or dl_by_url.get(url)
@@ -1589,6 +3451,7 @@ class TrackerController:
                     github_token=self.config.github_token,
                     timeout=12.0,
                     installed_since=installed_since,
+                    gitea_hosts=self.config.sources.alt_git.gitea_instances,
                 )
             )
             it = self.storage.get_item_by_id(item_id) if item_id else None
@@ -1732,7 +3595,7 @@ class TrackerController:
 
         return {"ok": False, "error": "Unknown action."}
 
-    def launch_local_tool(self, tool: str, drive: str) -> dict[str, Any]:
+    def launch_local_tool(self, tool: str, drive: str = "", *, downloads_dir: str | Path | None = None) -> dict[str, Any]:
         if tool == "neonbridge":
             bat = BASE_DIR / "Lancer_Neonbridge_Sandbox.bat"
             if bat.exists():
@@ -1758,15 +3621,15 @@ class TrackerController:
             return {"ok": False, "error": "Lancer_Gestionnaire_Dependances.bat not found."}
 
         if tool == "sandbox":
-            return self.launch_inspection_vm(drive)
+            return self.launch_inspection_vm(drive=drive, downloads_dir=downloads_dir)
 
         if tool == "folder":
-            d = drive.strip().rstrip(":\\/").upper()
-            target = Path(f"{d}:\\") / "GTA6_Sandbox_Downloads" / "by_role"
-            target.mkdir(parents=True, exist_ok=True)
-            if os.name == "nt":
-                os.startfile(str(target))  # type: ignore[attr-defined]
-            return {"ok": True, "message": f"Opened folder: {target}"}
+            root = self._resolve_downloads_root(downloads_dir, drive=drive)
+            if root is None:
+                return {"ok": False, "error": "Download directory not accessible."}
+            target = root / "by_role"
+            _open_folder_in_os(target)
+            return {"ok": True, "message": f"Opened folder: {target}", "path": str(target)}
 
         return {"ok": False, "error": f"Unknown tool: {tool}"}
 
@@ -1775,14 +3638,14 @@ class TrackerController:
             asyncio.run(self._async_watch_loop(selected_sources))
         except Exception as exc:
             with self._lock:
-                self.last_message = f"Erreur veille : {exc}"
+                self.last_message = f"Watch error: {exc}"
         finally:
             with self._lock:
                 self.running = False
                 self.watch_state = "stopped"
                 self.silent_mode = False
                 if self._stop_event.is_set():
-                    self.last_message = "Veille arrêtée proprement."
+                    self.last_message = "Watch stopped cleanly."
 
     async def _async_watch_loop(self, selected_sources: list[str]) -> None:
         selected = set(selected_sources)
@@ -1799,6 +3662,10 @@ class TrackerController:
             if run_all or "portwatch" in selected:
                 parallel_scrapers.append(
                     PortWatchScraper(self.config, client, snapshot_path=PORTWATCH_SNAPSHOT)
+                )
+            if run_all or "pc_race" in selected or "portwatch" in selected:
+                parallel_scrapers.append(
+                    PcRaceScraper(self.config, client, snapshot_path=PC_RACE_SNAPSHOT)
                 )
             if run_all or "github" in selected:
                 github_scraper = GitHubScraper(self.config, client)
@@ -1831,7 +3698,7 @@ class TrackerController:
 
             async def on_batch(_name: str, batch: list[ScrapedItem]) -> None:
                 async with batch_lock:
-                    if _name == "portwatch":
+                    if _name in {"portwatch", "pc_race"}:
                         accepted, rejected = list(batch), []
                     else:
                         accepted, rejected = rf.filter_items(batch)
@@ -1846,7 +3713,7 @@ class TrackerController:
                         self.total_rejected += len(rejected)
                         self.total_new += len(new_items)
                         auto_on = self.auto_download_enabled and not self.silent_mode
-                        auto_drive = self.auto_download_drive
+                        auto_dl_dir = self.downloads_dir
                         auto_min = self.auto_download_min_score
 
                     if auto_on and new_items:
@@ -1858,12 +3725,14 @@ class TrackerController:
                             if not self._gpu_compatible(it_gpus, f"{it.title} {it.url}", gpu_prof):
                                 continue
                             _track, role, _deps = classify_role_and_deps(it)
+                            if role in (self.settings.get("pinned_roles") or {}):
+                                continue
                             target_url = it.direct_links[0].url if it.direct_links else it.url
                             try:
                                 res = await self._download_and_replace_async(
                                     url=target_url,
                                     role=role,
-                                    drive=auto_drive,
+                                    downloads_dir=auto_dl_dir,
                                     client=client,
                                     item_id=it.id,
                                     replace_old=True,
@@ -1900,8 +3769,8 @@ class TrackerController:
                 with self._lock:
                     self.cycle += 1
                     self.watch_state = "running"
-                    mode_lbl = "🌙 Veille silencieuse" if self.silent_mode else "🟢 Veille active"
-                    self.last_message = f"{mode_lbl} — Cycle #{self.cycle} en cours..."
+                    mode_lbl = "🌙 Silent Watch" if self.silent_mode else "🟢 Active Watch"
+                    self.last_message = f"{mode_lbl} — Cycle #{self.cycle} running..."
                     for s in parallel_scrapers:
                         self.scraper_statuses[s.name] = "démarrage..."
                     if forum_scraper is not None:
@@ -1918,7 +3787,7 @@ class TrackerController:
                 if not self._stop_event.is_set():
                     with self._lock:
                         auto_on = self.auto_download_enabled and not self.silent_mode
-                        auto_drive = self.auto_download_drive
+                        auto_dl_dir = self.downloads_dir
                         gpu_prof = self.gpu_profile
                     if auto_on:
                         try:
@@ -1928,13 +3797,14 @@ class TrackerController:
                                 if (
                                     pil.get("update_suggested")
                                     and best
+                                    and best["role"] not in (self.settings.get("pinned_roles") or {})
                                     and best.get("gpu_ok", True)
                                     and best.get("download_url")
                                 ):
                                     res = await self._download_and_replace_async(
                                         url=best["download_url"],
                                         role=best["role"],
-                                        drive=auto_drive,
+                                        downloads_dir=auto_dl_dir,
                                         client=client,
                                         item_id=best["id"],
                                         replace_old=True,
@@ -1990,10 +3860,10 @@ class TrackerController:
                 continue
         return None
 
-    def launch_inspection_vm(self, drive: str) -> dict[str, Any]:
-        target = self._resolve_drive_target(drive)
+    def launch_inspection_vm(self, drive: str = "", *, downloads_dir: str | Path | None = None) -> dict[str, Any]:
+        target = self._resolve_downloads_root(downloads_dir, drive=drive)
         if target is None:
-            return {"ok": False, "error": f"Drive '{drive}' not found."}
+            return {"ok": False, "error": f"Storage directory not found: {downloads_dir or drive}"}
         qdir = target / "by_role"
         qdir.mkdir(parents=True, exist_ok=True)
         backends = detect_available_backends()
@@ -2024,10 +3894,10 @@ class TrackerController:
             "message": "Install Sandboxie-Plus (winget install Sandboxie.Plus).",
         }
 
-    def list_all_quarantine(self, drive: str) -> dict[str, Any]:
-        target = self._resolve_drive_target(drive)
+    def list_all_quarantine(self, drive: str = "", *, downloads_dir: str | Path | None = None) -> dict[str, Any]:
+        target = self._resolve_downloads_root(downloads_dir, drive=drive)
         if target is None:
-            return {"ok": False, "error": "Disque introuvable."}
+            return {"ok": False, "error": "Download directory not found."}
         files = list_quarantine_files(target)
         by_role = target / "by_role"
         if by_role.exists():
@@ -2275,6 +4145,8 @@ class TrackerController:
 
     def sync_online_news(self) -> dict[str, Any]:
         """Refreshes PortWatch VI + searches GitHub for recent open-source VI multiplayer / co-op / online mod projects."""
+        if self.is_offline_mode():
+            return {"ok": False, "offline": True, "error": "Strict Offline Mode is active — disable Offline Mode to refresh news."}
         self.sync_portwatch()
         found_gh: list[dict[str, Any]] = []
         headers = {"Accept": "application/vnd.github+json", "User-Agent": "VI-Community-Launcher/1.0"}
@@ -2326,16 +4198,42 @@ class TrackerController:
         active_gpu = (gpu or self.gpu_profile or "NVIDIA").upper()
         items = self.storage.get_top_items(limit=400, min_score=min_score)
         dl_by_url, dl_by_item = self.storage.get_download_history_map()
+        local_compat_map = self.storage.get_runtime_compat_map()
+        pinned_roles = dict(self.settings.get("pinned_roles") or {})
         pw_snapshot = load_portwatch_snapshot(PORTWATCH_SNAPSHOT)
         for _le in (pw_snapshot.get("leaderboard") or []):
             if isinstance(_le, dict) and _le.get("status"):
                 _st = str(_le["status"]).replace("En développement", "In Development").replace("Rendu ", "Render ")
                 _le["status"] = _st
+                _lk = str(_le.get("id") or _le.get("name") or "").strip().lower()
+                _loc = local_compat_map.get(_lk)
+                _le["compat_badge"] = classify_compat_badge(
+                    _st,
+                    score_pct=float(_le.get("score_pct") or 0.0),
+                    fps=float(_le.get("fps") or 0.0),
+                    local_record=_loc,
+                )
+        pc_race_snapshot = load_pc_race_snapshot(PC_RACE_SNAPSHOT)
+        for _pe in (pc_race_snapshot.get("leaderboard") or []):
+            if isinstance(_pe, dict):
+                _pst = str(_pe.get("status") or "In Development")
+                _pk = str(_pe.get("name") or _pe.get("id") or "").strip().lower()
+                _ploc = local_compat_map.get(_pk)
+                _pe["compat_badge"] = classify_compat_badge(
+                    _pst,
+                    score_pct=float(_pe.get("score_pct") or 0.0),
+                    fps=float(_pe.get("fps") or 0.0),
+                    local_record=_ploc,
+                )
         pw_by_repo = {
             (e.get("repo") or "").lower(): e
             for e in (pw_snapshot.get("leaderboard") or [])
             if e.get("repo")
         }
+        for _pe in (pc_race_snapshot.get("leaderboard") or []):
+            _rk = str(_pe.get("repo") or "").lower()
+            if _rk and _rk not in pw_by_repo:
+                pw_by_repo[_rk] = _pe
 
         by_role: dict[str, list[dict[str, Any]]] = {r: [] for r, _ in ALL_ROLES}
         all_rows: list[dict[str, Any]] = []
@@ -2378,6 +4276,12 @@ class TrackerController:
                 "gpu": item_gpus,
                 "gpu_ok": gpu_ok,
                 "status": clean_status,
+                "compat_badge": classify_compat_badge(
+                    clean_status,
+                    score_pct=pw_score,
+                    fps=float(pw_entry.get("fps") or 0.0) if pw_entry else 0.0,
+                    local_record=local_compat_map.get(it.title.split("/")[-1].lower()),
+                ),
                 "role": role,
                 "track": item_track,
                 "dependencies": deps,
@@ -2447,8 +4351,10 @@ class TrackerController:
                 elif best_cand["id"] == current_dl["id"] and best_cand["date_utc"] > current_dl["downloaded_at"]:
                     update_suggested = True
 
-            role_backup_dir = Path(f"{self.auto_download_drive}:\\") / "GTA6_Sandbox_Downloads" / "by_role" / _safe_role_folder(role) / "_backup"
+            role_backup_dir = self.downloads_dir / "by_role" / _safe_role_folder(role) / "_backup"
             has_backup = role_backup_dir.exists() and any(role_backup_dir.iterdir())
+            pin_info = pinned_roles.get(role)
+            is_pinned = bool(pin_info)
             roles_table.append(
                 {
                     "role": role,
@@ -2456,8 +4362,10 @@ class TrackerController:
                     "current": current_dl,
                     "best": best_cand,
                     "missing": current_dl is None,
-                    "update_suggested": update_suggested,
+                    "update_suggested": False if is_pinned else update_suggested,
                     "has_backup": has_backup,
+                    "pinned": is_pinned,
+                    "pin_info": pin_info,
                     "total_found": len(cands),
                 }
             )
@@ -2509,9 +4417,11 @@ class TrackerController:
             )
             current = next((m["current"] for m in matched if m["current"]), None)
             local_ok = _local_runtime_up_to_date(best)
-            # Only suggest update if best candidate is neither downloaded-up-to-date nor already compiled locally up-to-date
+            # Only suggest update if best candidate is neither pinned nor downloaded-up-to-date nor already compiled locally up-to-date
+            role_is_pinned = any(r in pinned_roles for r in role_names)
             upd = bool(
                 best
+                and not role_is_pinned
                 and not local_ok
                 and (
                     not best["downloaded"]
@@ -2605,7 +4515,10 @@ class TrackerController:
         neonbridge_ok = any(
             (r / "Neonbridge_VM" / "app" / "Neonbridge" / "neonbridge.exe").exists()
             or (r / "neonbridge.exe").exists()
-            for r in self._discover_runtime_roots(str(self.settings.get("runtimes_dir") or ""))
+            for r in self._discover_runtime_roots(
+                str(self.settings.get("runtimes_dir") or ""),
+                downloads_dir=self.downloads_dir,
+            )
         )
         pagiii_ok = (BASE_DIR / "Lancer_Pagiii_Tracker.bat").exists()
         # Default button is PLAY; only switch to UPDATE after an update check found undownloaded pillar updates
@@ -2625,22 +4538,99 @@ class TrackerController:
         tracked_runtimes.extend(["shadPS4 (PS5 Emu)", "Kyty (PS5 Emu)", "PC Recomp"])
         tracked_runtimes = list(dict.fromkeys(tracked_runtimes))
         available_runtimes = list(dict.fromkeys([*installed_runtimes, *tracked_runtimes]))
-        mods_state = self.mods.get_state(portwatch_tools=pw_snapshot.get("tools") or [])
+        runtime_compat: dict[str, dict[str, Any]] = {}
+        pw_board = pw_snapshot.get("leaderboard") or []
+        for rt_label in available_runtimes:
+            rt_low = rt_label.lower()
+            rt_base = rt_low.split(" (")[0].replace("lab:", "").strip()
+            matched_pw = next(
+                (
+                    e
+                    for e in pw_board
+                    if (e.get("name") and str(e["name"]).lower() in rt_low)
+                    or (e.get("id") and str(e["id"]).lower() in rt_low)
+                    or (e.get("repo") and rt_base and rt_base in str(e["repo"]).lower())
+                ),
+                None,
+            )
+            loc_rec = local_compat_map.get(rt_base) or next(
+                (v for k, v in local_compat_map.items() if k and (k in rt_low or rt_base in k)),
+                None,
+            )
+            badge = classify_compat_badge(
+                str(matched_pw.get("status") or "") if matched_pw else "",
+                score_pct=float(matched_pw.get("score_pct") or 0.0) if matched_pw else 0.0,
+                fps=float(matched_pw.get("fps") or 0.0) if matched_pw else 0.0,
+                local_record=loc_rec,
+            )
+            runtime_compat[rt_label] = {**badge, "local": loc_rec}
+
+        hub_items, reg_versions = self._load_workshop_hubs_cache()
+        mods_state = self.mods.get_state(
+            portwatch_tools=pw_snapshot.get("tools") or [],
+            hub_items=hub_items,
+            registry_versions=reg_versions,
+            game_dir=self._active_game_dir(),
+            stage_dir=self._mod_stage_dir(),
+            vanilla=bool(self.settings.get("vanilla_mode", False)),
+            runtime_version=str(self.settings.get("selected_runtime") or ""),
+        )
         online_news = self._build_online_news(pw_snapshot)
         show_logs_on = bool(self.settings.get("show_logs"))
         log_snap = self._read_game_log_tail(include_lines=show_logs_on)
         sys_mem = self._get_system_memory()
         saves_info = self.get_saves_info()
+        hw_profile = self.get_hardware_profile()
+        sdk_state = self.get_upscaler_sdk_state()
+
+        # Objective hardware-fit runtime ranking (zero artificial per-runner boost)
+        ranked_runtimes: list[dict[str, Any]] = []
+        for rt_label in available_runtimes:
+            rt_low = rt_label.lower()
+            rt_base = rt_low.split(" (")[0].replace("lab:", "").strip()
+            matched_pw = next(
+                (
+                    e
+                    for e in pw_board
+                    if (e.get("name") and str(e["name"]).lower() in rt_low)
+                    or (e.get("id") and str(e["id"]).lower() in rt_low)
+                    or (e.get("repo") and rt_base and rt_base in str(e["repo"]).lower())
+                ),
+                None,
+            )
+            loc_rec = (runtime_compat.get(rt_label) or {}).get("local")
+            is_inst = rt_label in installed_runtimes
+            ranked_runtimes.append(
+                score_runtime_for_hardware(
+                    rt_label,
+                    hw=hw_profile,
+                    pw_entry=matched_pw,
+                    local_record=loc_rec,
+                    installed=is_inst,
+                    supports_low_ram=("superbuild" in rt_low or "series-s" in rt_low),
+                )
+            )
+        ranked_runtimes.sort(key=lambda x: (-x["score"], not x["installed"], x["runtime"]))
+        recommended_runtime = ranked_runtimes[0] if ranked_runtimes else None
 
         with self._lock:
             prewarm_info = {
                 "state": self._prewarm_state,
                 "detail": self._prewarm_detail,
                 "runtime": self._prewarm_runtime,
+                "progress": dict(self._prewarm_progress) if self._prewarm_progress else None,
             }
             return {
                 "watch_state": self.watch_state,
                 "running": self.running,
+                "offline_mode": self.is_offline_mode(),
+                "active_profile": self.active_profile,
+                "profiles": self.profiles.list_profiles(),
+                "last_good_runtime": str(self.settings.get("last_good_runtime") or ""),
+                "hardware_profile": hw_profile,
+                "recommended_runtime": recommended_runtime,
+                "ranked_runtimes": ranked_runtimes[:8],
+                "sdk_state": sdk_state,
                 "silent_mode": self.silent_mode,
                 "silent_interval_minutes": self.silent_interval_minutes,
                 "cycle": self.cycle,
@@ -2648,6 +4638,10 @@ class TrackerController:
                 "last_message": self.last_message,
                 "auto_download_enabled": self.auto_download_enabled,
                 "auto_download_drive": self.auto_download_drive,
+                "downloads_dir": str(self.downloads_dir),
+                "default_downloads_dir": str(BASE_DIR),
+                "components_dir": str(self.downloads_dir / "by_role"),
+                "mods_dir": str(self.mods.mods_dir),
                 "auto_download_min_score": self.auto_download_min_score,
                 "gpu_profile": active_gpu,
                 "settings": dict(self.settings),
@@ -2663,6 +4657,15 @@ class TrackerController:
                 "dump_status": dump_status,
                 "available_runtimes": available_runtimes,
                 "runtime_groups": {"installed": installed_runtimes, "tracked": tracked_runtimes},
+                "runtime_compat": runtime_compat,
+                "portable_mode": self.is_portable_mode(),
+                "dump_verification": {
+                    "running": bool(self._dump_verify_state.get("running")),
+                    "progress": dict(self._dump_verify_state["progress"]) if self._dump_verify_state.get("progress") else None,
+                    "report": dict(self._dump_verify_state["report"]) if self._dump_verify_state.get("report") else None,
+                    "error": str(self._dump_verify_state.get("error") or ""),
+                },
+                "trusted_github_owners": self._effective_trusted_owners(),
                 "system_memory": sys_mem,
                 "prewarm": prewarm_info,
                 "saves_info": saves_info,
@@ -2676,6 +4679,7 @@ class TrackerController:
                     "warn_count": log_snap["warn_count"],
                 },
                 "mods": mods_state,
+                "active_downloads": self.get_active_downloads(),
                 "online_news": online_news,
                 "auto_logs": list(self.auto_logs[-20:]),
                 "game_logs": log_snap if show_logs_on else None,
@@ -2687,6 +4691,7 @@ class TrackerController:
                 "boot_summary": dict(self._boot_cache),
                 "discovered_count": len(discovered_list),
                 "portwatch": pw_snapshot,
+                "pc_race": pc_race_snapshot,
                 "local_tools": {
                     "neonbridge_ready": neonbridge_ok,
                     "pagiii_ready": pagiii_ok,
@@ -3893,7 +5898,7 @@ async function saveAutoCfg() {
     headers: {"Content-Type":"application/json"},
     body: JSON.stringify({
       enabled: document.getElementById("chkAutoDl").checked,
-      drive: document.getElementById("driveSel").value || "D",
+      drive: (document.getElementById("driveSel") && document.getElementById("driveSel").value) || "",
       min_score: 75,
       gpu_profile: document.getElementById("gpuSel") ? document.getElementById("gpuSel").value : "NVIDIA",
     })
@@ -3966,8 +5971,8 @@ async function confirmWhatsNewUpdate() {
   if (!pendingUpdate) return;
   const { dlUrl, role, itemId, title } = pendingUpdate;
   closeWhatsNew();
-  const drive = document.getElementById("driveSel").value || "D";
-  showLoader(`Téléchargement & scan Defender de [${role}] (${title || "composant"}) vers ${drive}:...`);
+  const drive = (document.getElementById("driveSel") && document.getElementById("driveSel").value) || "";
+  showLoader(`Téléchargement & scan Defender de [${role}] (${title || "composant"})...`);
   try {
     const res = await fetch("/api/download-role", {
       method: "POST",
@@ -3991,11 +5996,11 @@ async function confirmWhatsNewUpdate() {
 }
 
 async function runBootTest() {
-  const drive = document.getElementById("driveSel").value || "D";
+  const drive = (document.getElementById("driveSel") && document.getElementById("driveSel").value) || "";
   showLoader("Test Boot & Compilation des 2 voies (Recomp PC & Ému Xbox Series)...");
   document.getElementById("bootSummary").innerHTML = `<span class="spinner"></span> Analyse en cours...`;
   try {
-    const res = await fetch("/api/boot-test?drive=" + encodeURIComponent(drive));
+    const res = await fetch("/api/boot-test" + (drive ? "?drive=" + encodeURIComponent(drive) : ""));
     const r = await res.json();
     renderBootData(r);
     showToast(`🧪 Test Boot terminé : Recomp PC ${r.recomp_readiness_pct}% · Ému Xbox ${r.xbox_readiness_pct}%`, "ok");
@@ -4054,7 +6059,7 @@ async function syncPortWatch() {
 }
 
 async function launchTool(tool) {
-  const drive = document.getElementById("driveSel").value || "D";
+  const drive = (document.getElementById("driveSel") && document.getElementById("driveSel").value) || "";
   showLoader("Lancement de " + tool + "...");
   try {
     const res = await fetch("/api/launch-tool", {
@@ -4146,6 +6151,7 @@ def make_handler(controller: TrackerController) -> type[BaseHTTPRequestHandler]:
                 raw = ui_file.read_bytes() if ui_file.exists() else HTML_PAGE.encode("utf-8")
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
                 self.send_header("Content-Length", str(len(raw)))
                 self.end_headers()
                 self.wfile.write(raw)
@@ -4194,6 +6200,9 @@ def make_handler(controller: TrackerController) -> type[BaseHTTPRequestHandler]:
                     self.end_headers()
                     self.wfile.write(raw)
                     return
+                if controller.is_offline_mode():
+                    self.send_error(HTTPStatus.NOT_FOUND)
+                    return
                 try:
                     with httpx.Client(follow_redirects=True, timeout=10.0) as client:
                         resp = client.get(raw_u, headers={"User-Agent": "Mozilla/5.0 VI-Community-Launcher/1.0"})
@@ -4239,8 +6248,34 @@ def make_handler(controller: TrackerController) -> type[BaseHTTPRequestHandler]:
                     )
                 )
                 return
+            if parsed.path == "/api/download-progress":
+                self._send_json({"ok": True, "downloads": controller.get_active_downloads()})
+                return
+            if parsed.path == "/api/dump/verify-status":
+                self._send_json(controller.get_dump_verification_status())
+                return
+            if parsed.path == "/api/presets/list":
+                self._send_json(controller.list_presets(remote_url=(qs.get("url") or [""])[0]))
+                return
+            if parsed.path == "/api/profiles":
+                self._send_json(controller.list_profiles())
+                return
+            if parsed.path == "/api/hardware":
+                self._send_json(
+                    {
+                        "ok": True,
+                        "hardware_profile": controller.get_hardware_profile(force=True),
+                        "sdk_state": controller.get_upscaler_sdk_state(),
+                    }
+                )
+                return
             if parsed.path == "/api/boot-test":
-                self._send_json(controller.run_boot_test((qs.get("drive") or ["D"])[0]))
+                self._send_json(
+                    controller.run_boot_test(
+                        drive=(qs.get("drive") or [""])[0],
+                        downloads_dir=(qs.get("downloads_dir") or [None])[0],
+                    )
+                )
                 return
             if parsed.path == "/api/whats-new":
                 self._send_json(
@@ -4269,7 +6304,8 @@ def make_handler(controller: TrackerController) -> type[BaseHTTPRequestHandler]:
                 self._send_json(
                     controller.set_auto_config(
                         enabled=bool(body.get("enabled", True)),
-                        drive=str(body.get("drive") or "D"),
+                        drive=str(body.get("drive") or ""),
+                        downloads_dir=body.get("downloads_dir"),
                         min_score=int(body.get("min_score") or 75),
                         gpu_profile=body.get("gpu_profile"),
                     )
@@ -4280,11 +6316,91 @@ def make_handler(controller: TrackerController) -> type[BaseHTTPRequestHandler]:
                     controller.download_role_update(
                         url=str(body.get("url") or "").strip(),
                         role=str(body.get("role") or "Divers"),
-                        drive=str(body.get("drive") or "D"),
+                        drive=str(body.get("drive") or ""),
+                        downloads_dir=body.get("downloads_dir"),
                         item_id=body.get("item_id") or None,
                         replace_old=bool(body.get("replace_old", True)),
+                        confirm_untrusted=bool(body.get("confirm_untrusted", False)),
                     )
                 )
+                return
+            if parsed.path == "/api/pin-role":
+                self._send_json(
+                    controller.toggle_pin_role(
+                        role=str(body.get("role") or ""),
+                        item_id=str(body.get("item_id") or ""),
+                        title=str(body.get("title") or ""),
+                        version=str(body.get("version") or ""),
+                        pinned=body.get("pinned"),
+                    )
+                )
+                return
+            if parsed.path == "/api/dump/verify":
+                self._send_json(
+                    controller.start_dump_verification(
+                        algorithm=str(body.get("algorithm") or "sha256"),
+                        manifest_path=str(body.get("manifest_path") or ""),
+                        manifest_url=str(body.get("manifest_url") or ""),
+                        generate_manifest=bool(body.get("generate_manifest", False)),
+                    )
+                )
+                return
+            if parsed.path == "/api/presets/apply":
+                self._send_json(
+                    controller.apply_preset(
+                        preset_id=str(body.get("preset_id") or ""),
+                        raw_payload=str(body.get("payload") or ""),
+                    )
+                )
+                return
+            if parsed.path == "/api/presets/export":
+                self._send_json(
+                    controller.export_current_preset(
+                        name=str(body.get("name") or ""),
+                        description=str(body.get("description") or ""),
+                    )
+                )
+                return
+            if parsed.path == "/api/presets/import":
+                self._send_json(controller.apply_preset(raw_payload=str(body.get("payload") or "")))
+                return
+            if parsed.path == "/api/saves/sync":
+                self._send_json(controller.sync_saves_to_cloud(str(body.get("target_dir") or "")))
+                return
+            if parsed.path == "/api/saves/pick-sync-dir":
+                self._send_json(controller.pick_save_sync_dir())
+                return
+            if parsed.path == "/api/portable/toggle":
+                self._send_json(controller.toggle_portable_mode(bool(body.get("enabled", False))))
+                return
+            if parsed.path == "/api/provenance/trust-owner":
+                self._send_json(controller.trust_github_owner(str(body.get("owner") or "")))
+                return
+            if parsed.path == "/api/compat/record":
+                controller.storage.record_runtime_compat(
+                    str(body.get("runtime") or ""),
+                    str(body.get("status") or "In-Game"),
+                    fps=int(body.get("fps") or 0),
+                    crashed=bool(body.get("crashed", False)),
+                    notes=str(body.get("notes") or ""),
+                )
+                self._send_json({"ok": True})
+                return
+            if parsed.path == "/api/steam/export":
+                self._send_json(
+                    controller.export_to_steam(
+                        steam_config_dir=str(body.get("steam_config_dir") or ""),
+                        artwork_query=str(body.get("artwork_query") or "SixDeck"),
+                    )
+                )
+                return
+            if parsed.path == "/api/support/bundle":
+                self._send_json(controller.create_support_bundle())
+                return
+            if parsed.path == "/api/support/open-folder":
+                bdir = BASE_DIR / "reports" / "support_bundles"
+                _open_folder_in_os(bdir)
+                self._send_json({"ok": True, "path": str(bdir)})
                 return
             if parsed.path == "/api/reclassify":
                 self._send_json(controller.reclassify_database())
@@ -4294,6 +6410,9 @@ def make_handler(controller: TrackerController) -> type[BaseHTTPRequestHandler]:
                 return
             if parsed.path == "/api/sync-portwatch":
                 self._send_json(controller.sync_portwatch())
+                return
+            if parsed.path == "/api/sync-pc-race":
+                self._send_json(controller.sync_pc_race())
                 return
             if parsed.path == "/api/check-updates":
                 self._send_json(controller.check_updates_now())
@@ -4313,15 +6432,45 @@ def make_handler(controller: TrackerController) -> type[BaseHTTPRequestHandler]:
                 self._send_json(
                     controller.launch_local_tool(
                         tool=str(body.get("tool") or ""),
-                        drive=str(body.get("drive") or "D"),
+                        drive=str(body.get("drive") or ""),
+                        downloads_dir=body.get("downloads_dir"),
                     )
                 )
                 return
             if parsed.path == "/api/vm/launch":
-                self._send_json(controller.launch_inspection_vm(str(body.get("drive") or "D")))
+                self._send_json(
+                    controller.launch_inspection_vm(
+                        drive=str(body.get("drive") or ""),
+                        downloads_dir=body.get("downloads_dir"),
+                    )
+                )
                 return
             if parsed.path == "/api/play":
-                self._send_json(controller.play_game())
+                self._send_json(controller.play_game(safe_mode=False))
+                return
+            if parsed.path == "/api/play-safe":
+                self._send_json(controller.play_game(safe_mode=True))
+                return
+            if parsed.path == "/api/offline/toggle":
+                self._send_json(controller.toggle_offline_mode(bool(body.get("enabled", False))))
+                return
+            if parsed.path == "/api/profiles/switch":
+                self._send_json(controller.switch_profile(str(body.get("id") or body.get("name") or "")))
+                return
+            if parsed.path == "/api/profiles/create":
+                self._send_json(
+                    controller.create_profile(
+                        str(body.get("name") or ""),
+                        description=str(body.get("description") or ""),
+                        clone_current=bool(body.get("clone_current", True)),
+                    )
+                )
+                return
+            if parsed.path == "/api/profiles/delete":
+                self._send_json(controller.delete_profile(str(body.get("id") or "")))
+                return
+            if parsed.path == "/api/profiles/cli-command":
+                self._send_json(controller.get_profile_cli_command(str(body.get("id") or "")))
                 return
             if parsed.path == "/api/stop-game":
                 self._send_json(controller.stop_game())
@@ -4335,6 +6484,12 @@ def make_handler(controller: TrackerController) -> type[BaseHTTPRequestHandler]:
             if parsed.path == "/api/stop-prewarm":
                 self._send_json(controller.stop_prewarm())
                 return
+            if parsed.path == "/api/sdk/fetch":
+                self._send_json(controller.fetch_upscaler_sdks())
+                return
+            if parsed.path == "/api/agility/fetch":
+                self._send_json(controller.fetch_d3d12_agility())
+                return
             if parsed.path == "/api/saves/backup":
                 self._send_json(controller.backup_saves())
                 return
@@ -4347,11 +6502,50 @@ def make_handler(controller: TrackerController) -> type[BaseHTTPRequestHandler]:
             if parsed.path == "/api/update-all":
                 self._send_json(controller.update_all_pillars())
                 return
+            if parsed.path == "/api/quickstart/install-components":
+                self._send_json(
+                    controller.install_all_config_components(
+                        gpu_profile=str(body.get("gpu_profile") or "") or None,
+                    )
+                )
+                return
+            if parsed.path == "/api/quickstart/complete":
+                self._send_json(controller.update_launcher_settings({"quickstart_completed": True}))
+                return
+            if parsed.path == "/api/components/import":
+                raw_paths = body.get("paths")
+                if isinstance(raw_paths, str):
+                    paths_list = [raw_paths]
+                elif isinstance(raw_paths, list):
+                    paths_list = [str(x) for x in raw_paths]
+                elif body.get("path"):
+                    paths_list = [str(body.get("path"))]
+                else:
+                    paths_list = []
+                self._send_json(
+                    controller.import_component_files(
+                        paths=paths_list,
+                        role=str(body.get("role") or ""),
+                        item_id=body.get("item_id") or None,
+                        replace_old=bool(body.get("replace_old", True)),
+                    )
+                )
+                return
+            if parsed.path == "/api/components/pick-import":
+                self._send_json(
+                    controller.pick_and_import_component_files(
+                        role=str(body.get("role") or ""),
+                        item_id=body.get("item_id") or None,
+                        pick_folder=bool(body.get("pick_folder", False)),
+                    )
+                )
+                return
             if parsed.path == "/api/rollback-role":
                 self._send_json(
                     controller.rollback_role(
                         role=str(body.get("role") or ""),
-                        drive=str(body.get("drive") or "D"),
+                        drive=str(body.get("drive") or ""),
+                        downloads_dir=body.get("downloads_dir"),
                     )
                 )
                 return
@@ -4364,6 +6558,12 @@ def make_handler(controller: TrackerController) -> type[BaseHTTPRequestHandler]:
             if parsed.path == "/api/open-game-dir":
                 self._send_json(controller.open_game_dir())
                 return
+            if parsed.path == "/api/pick-downloads-dir":
+                self._send_json(controller.pick_downloads_dir())
+                return
+            if parsed.path == "/api/open-downloads-dir":
+                self._send_json(controller.open_downloads_dir())
+                return
             if parsed.path == "/api/open-game-log":
                 self._send_json(controller.open_game_log())
                 return
@@ -4374,16 +6574,33 @@ def make_handler(controller: TrackerController) -> type[BaseHTTPRequestHandler]:
                 self._send_json(controller.update_launcher_settings(body))
                 return
             if parsed.path == "/api/mods/toggle":
-                self._send_json(controller.mods.toggle(str(body.get("id") or ""), bool(body.get("value"))))
+                self._send_json(controller.toggle_mod(str(body.get("id") or ""), bool(body.get("value"))))
                 return
             if parsed.path == "/api/mods/move":
-                self._send_json(controller.mods.move(str(body.get("id") or ""), str(body.get("value") or "up")))
+                self._send_json(controller.move_mod(str(body.get("id") or ""), str(body.get("value") or "up")))
+                return
+            if parsed.path == "/api/mods/delete":
+                self._send_json(controller.delete_mod(str(body.get("id") or "")))
+                return
+            if parsed.path == "/api/mods/sync-game-links":
+                self._send_json(controller.sync_mods_game_links())
                 return
             if parsed.path == "/api/mods/open-folder":
                 self._send_json(controller.mods.open_folder())
                 return
             if parsed.path == "/api/mods/install-workshop":
-                self._send_json(controller.install_workshop_mod(str(body.get("id") or "")))
+                self._send_json(
+                    controller.install_workshop_mod(
+                        str(body.get("id") or ""),
+                        confirm_untrusted=bool(body.get("confirm_untrusted", False)),
+                    )
+                )
+                return
+            if parsed.path == "/api/mods/check-conflicts":
+                self._send_json({"ok": True, "conflicts": controller.mods.detect_rpf_conflicts()})
+                return
+            if parsed.path == "/api/mods/sync-hubs":
+                self._send_json(controller.sync_mod_hubs_and_registries())
                 return
             self.send_error(HTTPStatus.NOT_FOUND)
 
