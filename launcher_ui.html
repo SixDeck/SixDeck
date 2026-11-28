@@ -189,6 +189,8 @@
       transition: transform .14s, box-shadow .14s;
     }
     .btn-play:hover { transform: translateY(-1px); box-shadow: 0 14px 32px rgba(244, 63, 142, 0.30); }
+    .btn-play:focus { outline: none; }
+    .btn-play:focus-visible { outline: 2px solid rgba(244, 63, 142, 0.78); outline-offset: 2px; }
     .btn-play.update {
       background: var(--sunset);
       color: #fff;
@@ -1076,6 +1078,13 @@
                   <span>Local dump required</span>
                 </div>
                 <button class="meta-ghost-btn" onclick="pickGameDir()">Import</button>
+              </div>
+              <div id="importRuntimeBanner" class="meta-alert-row" style="display:none">
+                <div class="meta-alert-left" title="SixDeck tracks open-source runtimes without bundling binaries. Import a compiled victory.exe / xcl.exe (or release .zip), or place it inside SixDeck/runtimes/.">
+                  <span class="s-dot warn"></span>
+                  <span>Compiled runtime required</span>
+                </div>
+                <button class="meta-ghost-btn" onclick="pickRuntimeExe()">Import .exe</button>
               </div>
               <div id="hwWarningsBox" class="meta-alert-chips" style="display:none"></div>
               <div id="hwWarnDetail" class="meta-alert-detail"></div>
@@ -2201,6 +2210,7 @@ let gameRunning = false;
 let prewarmRunning = false;
 let hasPendingUpdates = false;
 let dumpReady = true;
+let runtimeReady = false;
 let currentSettings = {};
 let pendingUpdate = null;
 let lastSeenCrashId = 0;
@@ -2555,8 +2565,14 @@ async function refresh(force = false) {
         if (det) det.classList.remove("open");
       }
     }
+    const rg = d.runtime_groups || { installed: d.available_runtimes || [], tracked: [] };
+    const installedList = Array.isArray(rg.installed) ? rg.installed : [];
+    const trackedList = Array.isArray(rg.tracked) ? rg.tracked : [];
+    runtimeReady = installedList.length > 0;
+    const rtBanner = document.getElementById("importRuntimeBanner");
+    if (rtBanner) rtBanner.style.display = runtimeReady ? "none" : "flex";
     if (statusStrip) {
-      statusStrip.classList.toggle("show", !dumpReady || warns.length > 0);
+      statusStrip.classList.toggle("show", !dumpReady || !runtimeReady || warns.length > 0);
     }
 
     const recRtObj = d.recommended_runtime || null;
@@ -2623,15 +2639,15 @@ async function refresh(force = false) {
 
     // Clarified Runtime dropdown (Suggested for your PC + Installed & Ready + Tracked)
     const rtSel = document.getElementById("selRuntime");
-    const rg = d.runtime_groups || { installed: d.available_runtimes || [], tracked: [] };
-    const activeRt = currentSettings.selected_runtime || (rg.installed[0] || recRtName || "cool_fox (Direct)");
+    const activeRt = currentSettings.selected_runtime || (installedList[0] || recRtName || "cool_fox (Direct)");
     let rtHtml = "";
-    const installedList = Array.isArray(rg.installed) ? rg.installed : [];
-    const trackedList = Array.isArray(rg.tracked) ? rg.tracked : [];
     if (recRtName && (installedList.includes(recRtName) || trackedList.includes(recRtName))) {
+      const recIsInstalled = installedList.includes(recRtName);
       const scoreTag = recRtObj && recRtObj.score != null ? ` (${recRtObj.score})` : "";
-      rtHtml += `<optgroup label="Suggested for your PC">` +
-        `<option value="${esc(recRtName)}" ${recRtName===activeRt?'selected':''}>★ ${esc(recRtName)}${esc(scoreTag)}</option>` +
+      const instSuffix = recIsInstalled ? "" : " · Not installed";
+      const grpLabel = recIsInstalled ? "Suggested for your PC (Installed)" : "Suggested for your PC (Not installed)";
+      rtHtml += `<optgroup label="${grpLabel}">` +
+        `<option value="${esc(recRtName)}" ${recRtName===activeRt?'selected':''}>★ ${esc(recRtName)}${esc(scoreTag)}${instSuffix}</option>` +
         `</optgroup>`;
     }
     const otherInstalled = installedList.filter(r => r !== recRtName);
@@ -3728,12 +3744,32 @@ function toggleHwWarnDetail(idx) {
   det.classList.add("open");
 }
 
+async function pickRuntimeExe() {
+  showLoader("Select a compiled runtime (.exe or release .zip)...");
+  try {
+    const res = await fetch("/api/runtimes/pick", { method: "POST" });
+    const r = await res.json();
+    if (r.cancelled) return;
+    if (r.ok) {
+      showToast("✅ " + (r.message || "Runtime imported!"), "ok");
+      refresh(true);
+    } else {
+      showToast("⚠️ " + (r.error || "File picker unavailable — import your runtime in Components → Import."), "err");
+      openImportCompModal("2. Émulateur / Runtime");
+    }
+  } finally { hideLoader(); }
+}
+
 async function onMainPlayClick() {
   if (gameRunning) { await stopGameNow(); }
   else if (hasPendingUpdates) { await updateAllPillars(); }
   else if (!dumpReady) {
-    showToast("📂 Select your own local dump folder first.", "err");
+    showToast("Select your local dump folder first.", "err");
     await pickGameDir();
+  }
+  else if (!runtimeReady) {
+    showToast("No compiled runtime installed yet — select your victory.exe / xcl.exe (or release .zip).", "err");
+    await pickRuntimeExe();
   }
   else { await playNow(); }
 }

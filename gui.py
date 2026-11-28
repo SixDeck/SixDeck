@@ -727,6 +727,146 @@ class TrackerController:
                 )
         return lab_specs
 
+    def _discover_imported_runtimes(self, existing_exes: set[str]) -> list[dict[str, Any]]:
+        """Auto-discovers any compiled runtime executable placed in runtimes/, runners/, vendor/, or imported via Components."""
+        local_app = self._runtime_appdata_root()
+        shared_save = str(self._saves_dir())
+        ignored_exes = {
+            "sixdeck.exe",
+            "game_scarlett_master.exe",
+            "neonbridge.exe",
+            "crashpad_handler.exe",
+            "dxsetup.exe",
+        }
+        ignored_prefixes = ("unins", "setup", "vc_redist", "python", "pyinstaller")
+        known_runtime_prefixes = ("victory", "xcl", "scarlett", "superbuild", "dexnom", "vicetay", "vice-tay")
+
+        roots_with_mode: list[tuple[Path, int, bool]] = []
+        # (root_dir, max_depth, accept_any_exe)
+        for p in (
+            self.downloads_dir / "runtimes",
+            self.downloads_dir / "runners",
+            BASE_DIR / "runtimes",
+            BASE_DIR / "runners",
+            self.downloads_dir / "by_role" / _safe_role_folder("2. Émulateur / Runtime"),
+            self.downloads_dir / "by_role" / _safe_role_folder("1. Portage / Exe PC"),
+        ):
+            if p.exists():
+                roots_with_mode.append((p, 4, True))
+        custom_rt = str(self.settings.get("runtimes_dir") or "").strip()
+        if custom_rt and Path(custom_rt).exists():
+            roots_with_mode.append((Path(custom_rt), 4, True))
+        for p in (self.downloads_dir, BASE_DIR):
+            if p.exists():
+                roots_with_mode.append((p, 1, False))
+
+        specs: list[dict[str, Any]] = []
+        seen_exes = set(existing_exes)
+        seen_labels: set[str] = set()
+
+        for root, max_depth, accept_any_exe in roots_with_mode:
+            try:
+                root_resolved = root.resolve()
+            except OSError:
+                root_resolved = root
+            stack: list[tuple[Path, int]] = [(root, 0)]
+            while stack:
+                cur, depth = stack.pop()
+                if depth > max_depth:
+                    continue
+                try:
+                    entries = sorted(cur.iterdir(), key=lambda x: x.name.lower())
+                except OSError:
+                    continue
+                for entry in entries:
+                    low_name = entry.name.lower()
+                    if entry.is_dir():
+                        if low_name in {"_backup", ".git", "__pycache__", "node_modules", ".venv", "venv"}:
+                            continue
+                        if depth < max_depth:
+                            stack.append((entry, depth + 1))
+                        continue
+                    if not low_name.endswith(".exe"):
+                        continue
+                    if low_name in ignored_exes or any(low_name.startswith(pref) for pref in ignored_prefixes):
+                        continue
+                    is_known_name = any(low_name.startswith(pref) for pref in known_runtime_prefixes)
+                    if not accept_any_exe and not is_known_name:
+                        continue
+                    try:
+                        exe_key = str(entry.resolve()).lower()
+                    except OSError:
+                        exe_key = str(entry).lower()
+                    if exe_key in seen_exes:
+                        continue
+                    seen_exes.add(exe_key)
+
+                    # Derive a clean, readable runtime name from enclosing folder or filename
+                    parent_name = entry.parent.name
+                    if parent_name.lower() in {"release", "debug", "diag", "bin", "x64", "win64", "quarantine", "runtimes", "runners", "target"}:
+                        ancestors = [
+                            p.name
+                            for p in entry.parents
+                            if p != root_resolved
+                            and p.name.lower()
+                            not in {
+                                "release",
+                                "debug",
+                                "diag",
+                                "bin",
+                                "x64",
+                                "win64",
+                                "quarantine",
+                                "runtimes",
+                                "runners",
+                                "target",
+                                "by_role",
+                                _safe_role_folder("2. Émulateur / Runtime").lower(),
+                                _safe_role_folder("1. Portage / Exe PC").lower(),
+                            }
+                            and root_resolved in p.parents
+                        ]
+                        base_name = ancestors[0] if ancestors else entry.stem
+                    elif entry.parent == root_resolved:
+                        base_name = entry.stem
+                    else:
+                        base_name = parent_name
+
+                    base_name = base_name.strip() or entry.stem
+                    label = f"{base_name} (Direct)"
+                    if label.lower() in seen_labels:
+                        label = f"{base_name} [{entry.stem}] (Direct)"
+                    seen_labels.add(label.lower())
+
+                    low_full = f"{base_name} {entry.stem}".lower()
+                    is_xcl = low_name.startswith("xcl")
+                    is_superbuild = "superbuild" in low_full or "redsyl" in low_full
+                    rt_id = re.sub(r"[^a-z0-9_-]+", "_", base_name.lower()).strip("_") or "custom_rt"
+                    rt_home = local_app / "6ixpack" / rt_id
+                    specs.append(
+                        {
+                            "id": f"local_{rt_id}",
+                            "label": label,
+                            "aliases": (rt_id, base_name.lower(), entry.stem.lower()),
+                            "exe": entry,
+                            "mode": "dir" if is_xcl else "exe",
+                            "cli_style": "play" if is_superbuild else "run",
+                            "supports_low_ram": is_superbuild,
+                            "victory_home": str(rt_home) if is_superbuild else "",
+                            "extra_args": [] if (is_xcl or is_superbuild) else ["--execute"],
+                            "prewarm_mode": "superbuild" if is_superbuild else "none",
+                            "env": {}
+                            if is_xcl
+                            else {
+                                **({"VICTORY_HOME": str(rt_home)} if is_superbuild else {}),
+                                "VICTORY_CACHE_DIR": str(rt_home / "cache"),
+                                "VICTORY_DATA_DIR": shared_save,
+                                "VICTORY_RAYTRACING": "0",
+                            },
+                        }
+                    )
+        return specs
+
     def _get_direct_runtime_specs(self) -> list[dict[str, Any]]:
         """Lists compiled direct runtimes detectable on disk (portable detection, profile-isolated saves)."""
         local_app = self._runtime_appdata_root()
@@ -911,7 +1051,17 @@ class TrackerController:
                 "env": {},
             },
         ]
-        return [*base_specs, *self._discover_lab_runtimes()]
+        lab_specs = self._discover_lab_runtimes()
+        existing_exes: set[str] = set()
+        for s in [*base_specs, *lab_specs]:
+            p = Path(s["exe"])
+            if p.exists():
+                try:
+                    existing_exes.add(str(p.resolve()).lower())
+                except OSError:
+                    existing_exes.add(str(p).lower())
+        imported_specs = self._discover_imported_runtimes(existing_exes)
+        return [*base_specs, *lab_specs, *imported_specs]
 
     def _inspect_dump_status(self) -> dict[str, Any]:
         """Inspects the configured local dump directory via MicrosoftGame.Config or known dump executables."""
@@ -1008,9 +1158,12 @@ class TrackerController:
                 else None
             ) or self._resolve_direct_runtime(rt_name, strict=False)
             if spec is None:
-                msg = "Safe Mode failed: no compiled direct runtime (victory.exe / xcl.exe) found on disk."
+                msg = (
+                    "Safe Mode failed: no compiled runtime (victory.exe / xcl.exe) installed yet. "
+                    "Click 'Import .exe' on Play or place a compiled runtime inside SixDeck/runtimes/."
+                )
                 self._add_auto_log(f"❌ {msg}")
-                return {"ok": False, "error": msg}
+                return {"ok": False, "error": msg, "error_code": "missing_runtime"}
         else:
             spec = self._resolve_direct_runtime(rt_name, strict=True)
             if spec is None:
@@ -1018,12 +1171,15 @@ class TrackerController:
                 if any_spec is not None and rt_name:
                     msg = (
                         f"'{rt_name}' is tracked only and not compiled locally. "
-                        f"Select an 'Installed & Ready (Direct)' runtime in the dropdown (e.g. {any_spec['label']})."
+                        f"Select an 'Installed & Ready' runtime in the dropdown (e.g. {any_spec['label']})."
                     )
                 else:
-                    msg = "No compiled direct runtime (victory.exe / xcl.exe) found on disk."
+                    msg = (
+                        "No compiled runtime (victory.exe / xcl.exe) installed yet. "
+                        "Click 'Import .exe' on Play (or place your compiled runtime in SixDeck/runtimes/)."
+                    )
                 self._add_auto_log(f"❌ {msg}")
-                return {"ok": False, "error": msg}
+                return {"ok": False, "error": msg, "error_code": "missing_runtime"}
 
         hw = self.get_hardware_profile()
         rt_exe = Path(spec["exe"])
@@ -2480,6 +2636,35 @@ class TrackerController:
                     sha = h.hexdigest()
                     if replace_old:
                         replace_previous_role_files(q_dir, dst)
+                    # If importing a .zip runtime release into Emulator/PC Port role, safely extract compiled binaries to runtimes/
+                    if (
+                        dst.suffix.lower() == ".zip"
+                        and target_role in {"2. Émulateur / Runtime", "1. Portage / Exe PC"}
+                    ):
+                        try:
+                            with zipfile.ZipFile(dst, "r") as zf:
+                                exe_members = [
+                                    n
+                                    for n in zf.namelist()
+                                    if n.lower().endswith(".exe")
+                                    and not Path(n).name.lower().startswith(("unins", "setup", "vc_redist"))
+                                    and Path(n).name.lower() not in {"sixdeck.exe", "game_scarlett_master.exe"}
+                                ]
+                                if exe_members:
+                                    safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", dst.stem).strip("._-") or "imported_runtime"
+                                    rt_extract_dir = (self.downloads_dir / "runtimes" / safe_stem).resolve()
+                                    rt_extract_dir.mkdir(parents=True, exist_ok=True)
+                                    for member in zf.infolist():
+                                        if member.is_dir():
+                                            continue
+                                        target_member = (rt_extract_dir / member.filename).resolve()
+                                        if not str(target_member).startswith(str(rt_extract_dir)):
+                                            continue
+                                        target_member.parent.mkdir(parents=True, exist_ok=True)
+                                        with zf.open(member, "r") as zsrc, target_member.open("wb") as zdst:
+                                            shutil.copyfileobj(zsrc, zdst)
+                        except (zipfile.BadZipFile, OSError):
+                            pass
 
                 resolved_item_id = item_id
                 resolved_url = f"local://{_safe_role_folder(target_role)}/{dst.name}"
@@ -2599,6 +2784,51 @@ class TrackerController:
             if not paths:
                 return {"ok": True, "cancelled": True, "count": 0}
             return self.import_component_files(paths=paths, role=role, item_id=item_id)
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def pick_and_import_runtime(self) -> dict[str, Any]:
+        """Opens a native file dialog to import a compiled runtime (.exe or release .zip) and auto-selects it."""
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            initial = str(self.downloads_dir if self.downloads_dir.exists() else BASE_DIR)
+            chosen = filedialog.askopenfilename(
+                title="Select Compiled Runtime (victory.exe, xcl.exe, or release .zip)",
+                initialdir=initial,
+                filetypes=[
+                    ("Compiled Runtime (.exe / .zip)", "*.exe *.zip"),
+                    ("Executables", "*.exe"),
+                    ("Release Archives", "*.zip"),
+                    ("All Files", "*.*"),
+                ],
+            )
+            root.destroy()
+            if not chosen:
+                return {"ok": True, "cancelled": True}
+            before = {s["label"] for s in self._get_direct_runtime_specs() if Path(s["exe"]).exists()}
+            res = self.import_component_files(paths=[chosen], role="2. Émulateur / Runtime", replace_old=False)
+            if not res.get("ok"):
+                return res
+            after_specs = [s for s in self._get_direct_runtime_specs() if Path(s["exe"]).exists()]
+            picked_spec = next((s for s in after_specs if s["label"] not in before), None)
+            if picked_spec is None and after_specs:
+                picked_spec = after_specs[-1]
+            if picked_spec is not None:
+                self.update_launcher_settings({"selected_runtime": picked_spec["label"]})
+                return {
+                    "ok": True,
+                    "runtime": picked_spec["label"],
+                    "message": f"Runtime ready: {picked_spec['label']}",
+                }
+            return {
+                "ok": False,
+                "error": "Imported file did not contain a launchable runtime executable (.exe).",
+            }
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
@@ -6444,6 +6674,9 @@ def make_handler(controller: TrackerController) -> type[BaseHTTPRequestHandler]:
                         downloads_dir=body.get("downloads_dir"),
                     )
                 )
+                return
+            if parsed.path == "/api/runtimes/pick":
+                self._send_json(controller.pick_and_import_runtime())
                 return
             if parsed.path == "/api/play":
                 self._send_json(controller.play_game(safe_mode=False))

@@ -258,3 +258,38 @@ def test_linux_proton_command_wrapping(tmp_path: Path) -> None:
     assert env["DXVK_ENABLE_NVAPI"] == "1"
     assert env["VKD3D_CONFIG"] == "dxr11"
     assert Path(env["STEAM_COMPAT_DATA_PATH"]).is_dir()
+
+
+def test_generic_runtime_discovery_and_zip_import(tmp_path: Path, monkeypatch) -> None:
+    import zipfile
+    import gui
+
+    app_dir = tmp_path / "AppRoot"
+    app_dir.mkdir()
+    monkeypatch.setattr(gui, "BASE_DIR", app_dir)
+    monkeypatch.setattr(gui, "LAUNCHER_SETTINGS_PATH", app_dir / "data" / "launcher_settings.json")
+    monkeypatch.setattr(gui, "MODS_STATE_PATH", app_dir / "data" / "mods_state.json")
+    monkeypatch.setattr(gui, "list_local_drives", lambda: [])
+    monkeypatch.setattr(gui.TrackerController, "_warmup_boot_cache", lambda self: None)
+
+    ctrl = gui.TrackerController(gui.load_config(gui.CONFIG_PATH))
+    # Initially no compiled runtime exists -> play_game reports missing_runtime cleanly
+    dump_dir = tmp_path / "MyDump"
+    dump_dir.mkdir()
+    (dump_dir / "game_scarlett_master.exe").write_bytes(b"MZ")
+    ctrl.update_launcher_settings({"install_dir": str(dump_dir)})
+    res = ctrl.play_game()
+    assert res["ok"] is False
+    assert res.get("error_code") == "missing_runtime"
+    assert "Import .exe" in res["error"]
+
+    # Import a release .zip containing DexNom/victory.exe -> auto-extracted and auto-discovered
+    zpath = tmp_path / "DexNom-Release.zip"
+    with zipfile.ZipFile(zpath, "w") as zf:
+        zf.writestr("DexNom/victory.exe", b"MZ-runtime")
+    imp = ctrl.import_component_files(paths=[str(zpath)], role="2. Émulateur / Runtime")
+    assert imp["ok"] is True
+    specs = [s for s in ctrl._get_direct_runtime_specs() if Path(s["exe"]).exists()]
+    labels = [s["label"] for s in specs]
+    assert any("DexNom" in lbl for lbl in labels), f"Expected DexNom in {labels}"
+
