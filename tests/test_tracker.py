@@ -1111,6 +1111,7 @@ def test_presets_export_import_share_code_and_gpu_ranking(tmp_path: Path, monkey
     monkeypatch.setattr(gui, "BASE_DIR", app_dir)
     monkeypatch.setattr(gui, "LAUNCHER_SETTINGS_PATH", app_dir / "data" / "launcher_settings.json")
     monkeypatch.setattr(gui, "MODS_STATE_PATH", app_dir / "data" / "mods_state.json")
+    monkeypatch.setattr(gui, "list_local_drives", lambda: [])
     monkeypatch.setattr(gui.TrackerController, "_warmup_boot_cache", lambda self: None)
 
     ctrl = gui.TrackerController(gui.load_config(CONFIG_PATH))
@@ -1172,6 +1173,7 @@ def test_dump_checksum_verifier_pinning_compat_saves_and_steam(tmp_path: Path, m
     monkeypatch.setattr(gui, "BASE_DIR", app_dir)
     monkeypatch.setattr(gui, "LAUNCHER_SETTINGS_PATH", app_dir / "data" / "launcher_settings.json")
     monkeypatch.setattr(gui, "MODS_STATE_PATH", app_dir / "data" / "mods_state.json")
+    monkeypatch.setattr(gui, "list_local_drives", lambda: [])
     monkeypatch.setattr(gui.TrackerController, "_warmup_boot_cache", lambda self: None)
 
     ctrl = gui.TrackerController(gui.load_config(CONFIG_PATH))
@@ -1211,6 +1213,7 @@ def test_legacy_drive_d_never_fails_and_falls_back_to_downloads_dir(tmp_path: Pa
     monkeypatch.setattr(gui, "BASE_DIR", app_dir)
     monkeypatch.setattr(gui, "LAUNCHER_SETTINGS_PATH", app_dir / "data" / "launcher_settings.json")
     monkeypatch.setattr(gui, "MODS_STATE_PATH", app_dir / "data" / "mods_state.json")
+    monkeypatch.setattr(gui, "list_local_drives", lambda: [])
     monkeypatch.setattr(gui.TrackerController, "_warmup_boot_cache", lambda self: None)
 
     ctrl = gui.TrackerController(gui.load_config(CONFIG_PATH))
